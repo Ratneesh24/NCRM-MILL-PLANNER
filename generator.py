@@ -113,23 +113,16 @@ EXCLUDED_NEXT = {
 
 def filter_rolling_coils(df, learning_db=None):
     """
-    Apply inclusion criteria: only coils that are in/near the rolling-mill
-    queue and have a valid rolling target.
+    Apply inclusion criteria.
+    STRICT RULE: only coils whose Current Stage is exactly 'ROLLING MILL'.
+    No other stage is included regardless of Last Production Stage.
     """
     # Production plant filter
     if 'Production Plant' in df.columns:
         df = df[df['Production Plant'].fillna(0).astype(int).isin([760, 761])]
 
-    # Must currently be at / coming from rolling mill (with broader tolerance:
-    # ROLLING MILL, ANB i.e. annealing-bound coils, FURNACE just out, etc.)
-    cur_ok = df['Current Stage'].isin([
-        'ROLLING MILL', 'ANB', 'PENDING FOR PLAN', 'REWINDING'
-    ])
-    last_ok = df['Last Production Stage'].isin([
-        'ROLLING MILL', 'ANNEALING', 'ANB', 'REWINDING', 'PICKLING',
-        'FURNACE',
-    ])
-    df = df[cur_ok | last_ok].copy()
+    # STRICT: Current Stage must be exactly ROLLING MILL
+    df = df[df['Current Stage'] == 'ROLLING MILL'].copy()
 
     # Drop excluded next stages
     df = df[~df['Next Stage'].isin(EXCLUDED_NEXT)]
