@@ -42,7 +42,8 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["📋 Generate Plan", "🧠 Learn from Corrections", "📊 Stats & Rules"],
+        ["📋 Generate Plan", "🧠 Learn from Corrections",
+         "📊 Stats & Rules", "⚙️ Roll Optimiser"],
         label_visibility="collapsed",
     )
 
@@ -356,3 +357,246 @@ elif page == "📊 Stats & Rules":
             save_db(new_db)
             st.success("DB restored.")
             st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE 4 — ROLL OPTIMISER  (appended to existing app.py)
+# ══════════════════════════════════════════════════════════════════════════
+
+elif page == "⚙️ Roll Optimiser":
+    import pandas as pd
+    from optimiser import optimise_plan, ROLL_TYPE, get_change_cost
+
+    st.title("⚙️ Roll Change Optimiser")
+    st.caption(
+        "Upload today's WIP file — the optimiser analyses the planned section "
+        "sequence and finds the ordering that minimises roll changes on both mills, "
+        "maximising production MT."
+    )
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        wip_opt = st.file_uploader(
+            "Upload WIP file", type=["xlsx"], key="wip_opt"
+        )
+    with col2:
+        opt_date = st.date_input("Plan date", value=date.today(), key="opt_date")
+
+    if wip_opt and st.button("🔍 Analyse & Optimise", type="primary",
+                              use_container_width=True):
+        with st.spinner("Running roll change optimisation…"):
+            try:
+                from generator import load_wip, filter_rolling_coils, \
+                                       assign_all, build_sections
+                import tempfile, os
+
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+                    tmp.write(wip_opt.read())
+                    wip_path = tmp.name
+
+                df       = load_wip(wip_path)
+                eligible = filter_rolling_coils(df)
+                assigned = assign_all(eligible, load_db())
+                sections = build_sections(assigned, load_db())
+                result   = optimise_plan(sections)
+                os.unlink(wip_path)
+
+                cs = result['combined_summary']
+
+                # ── Top summary banner ────────────────────────────────
+                if cs['total_downtime_saved_min'] > 0:
+                    st.success(
+                        f"✅  Optimisation found **{cs['total_roll_changes_original'] - cs['total_roll_changes_optimised']} "
+                        f"fewer roll change(s)** — saves **{cs['total_downtime_saved_min']} minutes** "
+                        f"of downtime → **~{cs['total_extra_mt']} MT extra production possible today**"
+                    )
+                else:
+                    st.success("✅  Current sequence is already optimal — no improvement possible.")
+
+                # ── KPI metrics ───────────────────────────────────────
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Roll changes (current)",   cs['total_roll_changes_original'])
+                k2.metric("Roll changes (optimised)", cs['total_roll_changes_optimised'],
+                          delta=f"-{cs['total_roll_changes_original']-cs['total_roll_changes_optimised']}",
+                          delta_color="inverse")
+                k3.metric("Downtime saved",  f"{cs['total_downtime_saved_min']} min")
+                k4.metric("Extra MT possible", f"~{cs['total_extra_mt']} MT",
+                          delta="production gain", delta_color="normal")
+
+                st.divider()
+
+                # ── Hints ─────────────────────────────────────────────
+                st.subheader("💡 Optimisation Hints")
+                for h in result['hints']:
+                    sev = h['severity']
+                    icon = {'HIGH': '🔴', 'MEDIUM': '🟡',
+                            'WARN': '🟠', 'OK': '🟢'}.get(sev, '⚪')
+                    with st.expander(f"{icon}  {h['title']}", expanded=(sev == 'HIGH')):
+                        st.code(h['detail'], language="text")
+                        if h['action']:
+                            st.info(f"**Action required:**\n{h['action']}")
+
+                st.divider()
+
+                # ── CRM04 sequence comparison ─────────────────────────
+                st.subheader("CRM-04 — Section Sequence")
+                a04 = result['crm04_analysis']
+                col_orig, col_opt = st.columns(2)
+
+                with col_orig:
+                    st.markdown(f"**Current** — {a04['original_changes']} roll change(s), "
+                                f"{a04['original_downtime_min']} min downtime")
+                    rows04_orig = []
+                    prev_roll = None
+                    for i, sk in enumerate(a04['original_sequence']):
+                        roll = ROLL_TYPE.get(sk, '?')
+                        change = "⚠️ ROLL CHANGE" if (prev_roll and prev_roll != roll) else ""
+                        rows04_orig.append({
+                            "Pos": i+1, "Section": sk.replace('_',' ').title(),
+                            "Roll Type": roll, "": change
+                        })
+                        prev_roll = roll
+                    st.dataframe(pd.DataFrame(rows04_orig),
+                                 use_container_width=True, hide_index=True)
+
+                with col_opt:
+                    st.markdown(f"**Optimised** — {a04['optimised_changes']} roll change(s), "
+                                f"{a04['optimised_downtime_min']} min downtime  "
+                                f"💾 saves {a04['saved_minutes']} min")
+                    rows04_opt = []
+                    prev_roll = None
+                    for i, sk in enumerate(a04['optimised_sequence']):
+                        roll = ROLL_TYPE.get(sk, '?')
+                        change = "⚠️ ROLL CHANGE" if (prev_roll and prev_roll != roll) else ""
+                        rows04_opt.append({
+                            "Pos": i+1, "Section": sk.replace('_',' ').title(),
+                            "Roll Type": roll, "": change
+                        })
+                        prev_roll = roll
+                    st.dataframe(pd.DataFrame(rows04_opt),
+                                 use_container_width=True, hide_index=True)
+
+                st.divider()
+
+                # ── CRM06 sequence comparison ─────────────────────────
+                st.subheader("CRM-06 — Section Sequence")
+                a06 = result['crm06_analysis']
+                col_orig6, col_opt6 = st.columns(2)
+
+                with col_orig6:
+                    st.markdown(f"**Current** — {a06['original_changes']} roll change(s), "
+                                f"{a06['original_downtime_min']} min downtime")
+                    rows06_orig = []
+                    prev_roll = None
+                    for i, sk in enumerate(a06['original_sequence']):
+                        roll = ROLL_TYPE.get(sk, '?')
+                        change = "⚠️ ROLL CHANGE" if (prev_roll and prev_roll != roll) else ""
+                        rows06_orig.append({
+                            "Pos": i+1, "Section": sk.replace('_',' ').title(),
+                            "Roll Type": roll, "": change
+                        })
+                        prev_roll = roll
+                    st.dataframe(pd.DataFrame(rows06_orig),
+                                 use_container_width=True, hide_index=True)
+
+                with col_opt6:
+                    st.markdown(f"**Optimised** — {a06['optimised_changes']} roll change(s), "
+                                f"{a06['optimised_downtime_min']} min downtime  "
+                                f"💾 saves {a06['saved_minutes']} min")
+                    rows06_opt = []
+                    prev_roll = None
+                    for i, sk in enumerate(a06['optimised_sequence']):
+                        roll = ROLL_TYPE.get(sk, '?')
+                        change = "⚠️ ROLL CHANGE" if (prev_roll and prev_roll != roll) else ""
+                        rows06_opt.append({
+                            "Pos": i+1, "Section": sk.replace('_',' ').title(),
+                            "Roll Type": roll, "": change
+                        })
+                        prev_roll = roll
+                    st.dataframe(pd.DataFrame(rows06_opt),
+                                 use_container_width=True, hide_index=True)
+
+                st.divider()
+
+                # ── Roll change event breakdown ───────────────────────
+                st.subheader("Roll Change Events — Before vs After")
+                all_events = []
+                for evt in a04['change_events_original']:
+                    all_events.append({
+                        "Mill": "CRM04", "Status": "Current",
+                        "From Section": evt['from_section'].replace('_',' ').title(),
+                        "To Section":   evt['to_section'].replace('_',' ').title(),
+                        "From Roll":    evt['from_roll'],
+                        "To Roll":      evt['to_roll'],
+                        "Downtime (min)": evt['minutes'],
+                    })
+                for evt in a04['change_events_optimised']:
+                    all_events.append({
+                        "Mill": "CRM04", "Status": "Optimised",
+                        "From Section": evt['from_section'].replace('_',' ').title(),
+                        "To Section":   evt['to_section'].replace('_',' ').title(),
+                        "From Roll":    evt['from_roll'],
+                        "To Roll":      evt['to_roll'],
+                        "Downtime (min)": evt['minutes'],
+                    })
+                for evt in a06['change_events_original']:
+                    all_events.append({
+                        "Mill": "CRM06", "Status": "Current",
+                        "From Section": evt['from_section'].replace('_',' ').title(),
+                        "To Section":   evt['to_section'].replace('_',' ').title(),
+                        "From Roll":    evt['from_roll'],
+                        "To Roll":      evt['to_roll'],
+                        "Downtime (min)": evt['minutes'],
+                    })
+                for evt in a06['change_events_optimised']:
+                    all_events.append({
+                        "Mill": "CRM06", "Status": "Optimised",
+                        "From Section": evt['from_section'].replace('_',' ').title(),
+                        "To Section":   evt['to_section'].replace('_',' ').title(),
+                        "From Roll":    evt['from_roll'],
+                        "To Roll":      evt['to_roll'],
+                        "Downtime (min)": evt['minutes'],
+                    })
+
+                if all_events:
+                    events_df = pd.DataFrame(all_events)
+                    st.dataframe(events_df, use_container_width=True, hide_index=True)
+
+                    # Bar chart: downtime current vs optimised
+                    chart_data = pd.DataFrame({
+                        "Mill":      ["CRM04 Current", "CRM04 Optimised",
+                                      "CRM06 Current", "CRM06 Optimised"],
+                        "Downtime (min)": [
+                            a04['original_downtime_min'],
+                            a04['optimised_downtime_min'],
+                            a06['original_downtime_min'],
+                            a06['optimised_downtime_min'],
+                        ]
+                    })
+                    st.subheader("Downtime Comparison")
+                    st.bar_chart(chart_data.set_index("Mill"))
+
+            except Exception as e:
+                st.error(f"Optimisation error: {e}")
+                import traceback; st.code(traceback.format_exc())
+
+    elif not wip_opt:
+        st.info("👆 Upload today's WIP file to run the roll change optimisation.")
+
+        # Show reference: roll change time matrix
+        with st.expander("📖 Roll Change Time Reference (minutes)"):
+            from optimiser import ROLL_CHANGE_MINUTES
+            import pandas as pd
+            roll_types = ['LIGHT_MATT', 'BRIGHT', 'SUPER_BRIGHT',
+                          'CHROME_PLATED', 'HEAVY_MATT']
+            matrix = {}
+            for r1 in roll_types:
+                matrix[r1] = {}
+                for r2 in roll_types:
+                    if r1 == r2:
+                        matrix[r1][r2] = 0
+                    else:
+                        matrix[r1][r2] = ROLL_CHANGE_MINUTES.get(
+                            frozenset([r1, r2]), 45)
+            st.dataframe(pd.DataFrame(matrix), use_container_width=True)
+            st.caption("Values in minutes. Source: CRM Sahibabad historical changeover data.")
