@@ -312,7 +312,7 @@ def _coil_row(row, plan_date_serial, customer_abbrev_lookup):
 
     return [
         plan_date_serial,                                  # Date
-        plan_date_serial,                                  # Batch
+        _s(row.get('Coil Number')),                        # Batch = Coil Number
         _s(row.get('SO No')),                              # SO No
         _f(row.get('Actual Thick')),                       # Thick
         int(_f(row.get('Actual Width'))) if _f(row.get('Actual Width')) else '',
