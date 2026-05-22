@@ -30,9 +30,56 @@ BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 # ---------------------------------------------------------------------------
 # Load + filter
 # ---------------------------------------------------------------------------
+REQUIRED_COLUMNS = [
+    'Actual Thick', 'Actual Width', 'Input Coil Weight',
+    'Plan Rolling Thick 1', 'Current Stage', 'Next Stage',
+    'Product Code', 'Actual Quality', 'Cust TDC', 'Production Plant',
+]
+
+def _detect_sheet(filepath):
+    """
+    Return the best sheet name to use from the workbook.
+    Preference order:
+      1. 'Sheet1'  (exact match)
+      2. Any sheet whose name contains 'sheet' (case-insensitive)
+      3. First sheet in the workbook
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+    names = wb.sheetnames
+    wb.close()
+    if 'Sheet1' in names:
+        return 'Sheet1'
+    for n in names:
+        if 'sheet' in n.lower():
+            return n
+    return names[0]   # fall back to first sheet
+
+
 def load_wip(filepath):
-    """Read the WIP file (Sheet1) and normalise dtypes."""
-    df = pd.read_excel(filepath, sheet_name='Sheet1')
+    """
+    Read the WIP file and normalise dtypes.
+
+    - Accepts any filename.
+    - Auto-detects the correct sheet (prefers 'Sheet1', falls back gracefully).
+    - Raises a clear ValueError listing missing columns if the structure
+      does not match expectations, instead of a cryptic KeyError later.
+    """
+    sheet_name = _detect_sheet(filepath)
+    df = pd.read_excel(filepath, sheet_name=sheet_name)
+
+    # Strip whitespace from column headers (common when exported from SAP)
+    df.columns = df.columns.str.strip()
+
+    # Validate required columns
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"The uploaded file is missing {len(missing)} required column(s):\n"
+            + "\n".join(f"  • {c}" for c in missing)
+            + "\n\nMake sure you are uploading the correct WIP coil staging export "
+              f"(sheet used: '{sheet_name}', columns found: {list(df.columns[:8])} …)"
+        )
 
     # Coerce numerics that we rely on
     num_cols = ['Actual Thick', 'Actual Width', 'Input Coil Weight',
