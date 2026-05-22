@@ -3,47 +3,94 @@ db.py — Supabase persistence layer for learning_db
 ===================================================
 Stores the entire learning_db as a single JSONB document in Supabase.
 
-Table schema (create once in Supabase dashboard):
+Table schema (create once in Supabase SQL Editor):
     CREATE TABLE learning_db (
         key        TEXT PRIMARY KEY,
         data       JSONB,
         updated_at TIMESTAMPTZ DEFAULT now()
     );
 
-Environment variables required (set in Streamlit Cloud secrets):
-    SUPABASE_URL  = https://xyzxyz.supabase.co
-    SUPABASE_KEY  = your-anon-public-key
+Streamlit secrets required (Settings → Secrets in Streamlit Cloud):
+    SUPABASE_URL = "https://ypgydkhytrjvbozkebed.supabase.co"
+    SUPABASE_KEY = "sb_secret_..."   ← use the SECRET key, not publishable
 
-Fallback: if env vars are absent, falls back to local /tmp/learning_db.json
-so the app works even before Supabase is configured.
+Fallback: if env vars absent or connection fails, uses /tmp/learning_db.json
 """
 
 import json
 import os
 from datetime import datetime
 
-# The single row key used to store the DB document
 _ROW_KEY = "mill_planner_v1"
 
-# ── optional import — graceful degradation if supabase not installed ────────
 try:
-    from supabase import create_client, Client
+    from supabase import create_client
     _SUPABASE_AVAILABLE = True
 except ImportError:
     _SUPABASE_AVAILABLE = False
 
 
-def _get_client():
-    """Return a Supabase client, or None if not configured."""
-    if not _SUPABASE_AVAILABLE:
-        return None
-    url = os.environ.get("SUPABASE_URL", "").strip()
-    key = os.environ.get("SUPABASE_KEY", "").strip()
-    if not url or not key:
-        return None
+def _get_env():
+    """
+    Read SUPABASE_URL and SUPABASE_KEY from:
+      1. Streamlit secrets (st.secrets) — primary when running on Streamlit Cloud
+      2. os.environ — fallback / local dev
+    Returns (url, key) strings or ('', '') if not found.
+    """
+    url = key = ""
+
+    # Try Streamlit secrets first
     try:
-        return create_client(url, key)
+        import streamlit as st
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_KEY", "")
     except Exception:
+        pass
+
+    # Fall back to environment variables
+    if not url:
+        url = os.environ.get("SUPABASE_URL", "").strip()
+    if not key:
+        key = os.environ.get("SUPABASE_KEY", "").strip()
+
+    return url.strip(), key.strip()
+
+
+_client_cache = None
+_last_error   = ""
+
+def _get_client():
+    """Return a cached Supabase client, or None with error stored in _last_error."""
+    global _client_cache, _last_error
+
+    if _client_cache is not None:
+        return _client_cache
+
+    if not _SUPABASE_AVAILABLE:
+        _last_error = "supabase package not installed"
+        return None
+
+    url, key = _get_env()
+
+    if not url:
+        _last_error = "SUPABASE_URL not set in Streamlit secrets"
+        return None
+    if not key:
+        _last_error = "SUPABASE_KEY not set in Streamlit secrets"
+        return None
+    if key.startswith("sb_publishable_"):
+        _last_error = (
+            "Wrong key type — you used the Publishable key. "
+            "Use the SECRET key (sb_secret_...) from Settings → API Keys → Secret keys."
+        )
+        return None
+
+    try:
+        _client_cache = create_client(url, key)
+        _last_error = ""
+        return _client_cache
+    except Exception as e:
+        _last_error = f"create_client failed: {e}"
         return None
 
 
@@ -51,7 +98,7 @@ def _local_path():
     return os.environ.get("LOCAL_DB_PATH", "/tmp/learning_db.json")
 
 
-# ── Empty DB template (matches learner.py EMPTY_DB) ────────────────────────
+# ── Empty DB template ───────────────────────────────────────────────────────
 EMPTY_DB = {
     "schema_version":      "1.0",
     "last_updated":        "",
@@ -73,44 +120,36 @@ EMPTY_DB = {
 }
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Public API — used everywhere instead of load_db / save_db from learner.py
-# ────────────────────────────────────────────────────────────────────────────
+def _merge_empty(db):
+    for k, v in EMPTY_DB.items():
+        if k not in db:
+            db[k] = v
+    return db
+
+
+# ── Public API ──────────────────────────────────────────────────────────────
 
 def load_db() -> dict:
-    """
-    Load the learning DB.
-    Tries Supabase first; falls back to local file.
-    Returns an initialised empty DB if neither exists.
-    """
+    """Load DB from Supabase, falling back to local file."""
     client = _get_client()
-
     if client:
         try:
-            resp = client.table("learning_db") \
-                         .select("data") \
-                         .eq("key", _ROW_KEY) \
-                         .execute()
+            resp = (client.table("learning_db")
+                          .select("data")
+                          .eq("key", _ROW_KEY)
+                          .execute())
             if resp.data:
-                db = resp.data[0]["data"]
-                # Forward-compatibility: add any missing top-level keys
-                for k, v in EMPTY_DB.items():
-                    if k not in db:
-                        db[k] = v
-                return db
+                return _merge_empty(resp.data[0]["data"])
         except Exception as e:
-            print(f"[Supabase] load failed ({e}), falling back to local file")
+            global _last_error
+            _last_error = f"Supabase read error: {e}"
 
-    # ── Local fallback ──────────────────────────────────────────────────
+    # Local fallback
     local = _local_path()
     if os.path.exists(local):
         try:
             with open(local) as f:
-                db = json.load(f)
-            for k, v in EMPTY_DB.items():
-                if k not in db:
-                    db[k] = v
-            return db
+                return _merge_empty(json.load(f))
         except Exception:
             pass
 
@@ -118,16 +157,11 @@ def load_db() -> dict:
 
 
 def save_db(db: dict) -> bool:
-    """
-    Persist the learning DB.
-    Writes to Supabase (upsert) AND local file (backup).
-    Returns True on success.
-    """
+    """Save DB to Supabase (upsert) and local file as backup."""
     db["last_updated"] = datetime.utcnow().isoformat()
-
     success = False
-    client = _get_client()
 
+    client = _get_client()
     if client:
         try:
             client.table("learning_db").upsert({
@@ -137,9 +171,10 @@ def save_db(db: dict) -> bool:
             }).execute()
             success = True
         except Exception as e:
-            print(f"[Supabase] save failed ({e}), saving locally only")
+            global _last_error
+            _last_error = f"Supabase write error: {e}"
 
-    # Always write local backup regardless
+    # Always write local backup
     try:
         local = _local_path()
         tmp   = local + ".tmp"
@@ -147,29 +182,32 @@ def save_db(db: dict) -> bool:
             json.dump(db, f, indent=2, default=str)
         os.replace(tmp, local)
         if not success:
-            success = True   # local save succeeded
-    except Exception as e:
-        print(f"[Local] save also failed: {e}")
+            success = True
+    except Exception:
+        pass
 
     return success
 
 
 def is_supabase_connected() -> bool:
-    """Return True if Supabase env vars are set and reachable."""
+    """Return True only if client exists AND a real query succeeds."""
     client = _get_client()
     if not client:
         return False
     try:
         client.table("learning_db").select("key").limit(1).execute()
         return True
-    except Exception:
+    except Exception as e:
+        global _last_error
+        _last_error = f"Connection test failed: {e}"
         return False
 
 
 def get_storage_mode() -> str:
-    """Human-readable string describing where the DB is being stored."""
+    """Human-readable storage status, including error reason if disconnected."""
+    global _last_error
+    _last_error = ""          # reset before fresh check
     if is_supabase_connected():
         return "☁️  Supabase (persistent)"
-    if os.path.exists(_local_path()):
-        return "💾  Local file (resets on server restart)"
-    return "🆕  Not initialised yet"
+    reason = _last_error or "env vars not set"
+    return f"💾  Local only — {reason}"
