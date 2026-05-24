@@ -161,30 +161,60 @@ def assign_all(df, learning_db=None):
 
 def split_combined_mill(group_df, section_key):
     """
-    For ROLLING / FIRST_ROLLING / RE_ROLLING / TUBE_FH with mill = 'CRM04/06',
-    decide whether to keep combined or split based on work-centre.
-    Returns dict {mill_code: sub_df}.
+    Split any remaining CRM04/06 combined groups into CRM04 and CRM06.
+    Uses Work Center first, then width-based heuristic.
+    Never returns CRM04/06 combined — always splits into two.
     """
-    if section_key not in {'ROLLING', 'TUBE_FH'}:
-        return {group_df['_mill'].iloc[0]: group_df}
+    mill = group_df['_mill'].iloc[0] if not group_df.empty else 'CRM04'
 
-    # If WorkCenter info clearly separates CRM04 vs CRM06 coils, split
+    # If already a specific mill, just return it
+    if mill != 'CRM04/06':
+        return {mill: group_df}
+
+    # Try Work Center split first
     wc = group_df['Work Center'].fillna('').astype(str).str.upper()
-    crm04_mask = wc.str.contains('CRM04')
-    crm06_mask = wc.str.contains('CRM06')
+    crm04_wc = wc.str.contains('CRM04|SNCRM04|SWPL00')
+    crm06_wc = wc.str.contains('CRM06|SWCRS1|SWCRS2')
 
-    if crm04_mask.any() and crm06_mask.any():
-        # Split based on actual work-centre assignment
-        return {
-            'CRM04': group_df[crm04_mask].copy(),
-            'CRM06': group_df[crm06_mask].copy(),
-        }
-    if crm04_mask.any() and not crm06_mask.any():
-        return {'CRM04': group_df[crm04_mask | ~crm06_mask].copy()}
-    if crm06_mask.any() and not crm04_mask.any():
-        return {'CRM06': group_df[crm06_mask | ~crm04_mask].copy()}
+    has04 = crm04_wc.any()
+    has06 = crm06_wc.any()
 
-    return {'CRM04/06': group_df}
+    if has04 and has06:
+        rest = group_df[~crm04_wc & ~crm06_wc]
+        g04  = pd.concat([group_df[crm04_wc], rest]).drop_duplicates()
+        g06  = group_df[crm06_wc]
+        return {'CRM04': g04.copy(), 'CRM06': g06.copy()}
+
+    if has04:
+        return {'CRM04': group_df.copy()}
+    if has06:
+        return {'CRM06': group_df.copy()}
+
+    # Width-based heuristic split:
+    # Wider / thicker coils → CRM04 (higher-capacity mill)
+    # Narrower / thinner   → CRM06
+    if section_key == 'TUBE_FH':
+        # RP01/RP02 storage → CRM04; R037 narrow → CRM06
+        stor = group_df['Storage Location'].fillna('').astype(str)
+        crm04_stor = stor.isin(['RP01', 'RP02', 'R032'])
+        g04 = group_df[crm04_stor]
+        g06 = group_df[~crm04_stor]
+        if not g04.empty and not g06.empty:
+            return {'CRM04': g04.copy(), 'CRM06': g06.copy()}
+        if not g04.empty:
+            return {'CRM04': g04.copy()}
+        return {'CRM06': g06.copy()}
+
+    # General: split by thickness — thicker heavy gauge → CRM04
+    thick = group_df['Actual Thick'].fillna(0).astype(float)
+    median_thick = thick.median()
+    g04 = group_df[thick >= median_thick]
+    g06 = group_df[thick < median_thick]
+    if g04.empty:
+        return {'CRM06': group_df.copy()}
+    if g06.empty:
+        return {'CRM04': group_df.copy()}
+    return {'CRM04': g04.copy(), 'CRM06': g06.copy()}
 
 
 def sort_section(section_df):
@@ -213,27 +243,43 @@ def build_sections(df, learning_db=None):
         if sec_df.empty:
             continue
 
-        # Group by mill, then by potential split
-        mills_present = sec_df['_mill'].unique()
+        # First resolve any remaining CRM04/06 combined assignments
+        resolved = []
+        for _, row in sec_df.iterrows():
+            if row['_mill'] == 'CRM04/06':
+                # Re-run split logic on this single row's group
+                sub = split_combined_mill(
+                    sec_df[sec_df['_mill'] == 'CRM04/06'], section_key)
+                for sub_mill, sub_df in sub.items():
+                    sub_df = sub_df.copy()
+                    sub_df['_mill'] = sub_mill
+                    resolved.append(sub_df)
+                break
+            else:
+                resolved.append(sec_df[sec_df['_mill'] != 'CRM04/06'])
+                break
 
-        # Order mills for output: CRM04, CRM04/06, CRM06
-        ordered_mills = ([m for m in MILL_ORDER if m in mills_present]
-                         + [m for m in mills_present if m not in MILL_ORDER])
+        # Rebuild sec_df with resolved mills
+        if resolved:
+            sec_df = pd.concat(resolved).drop_duplicates(
+                subset=['Coil Number']).reset_index(drop=True)
 
-        for mill in ordered_mills:
-            group_df = sec_df[sec_df['_mill'] == mill]
-            sub_groups = split_combined_mill(group_df, section_key)
+        # Now group by mill and produce ONE section per mill
+        mills_present = [m for m in MILL_ORDER if m in sec_df['_mill'].unique()]
+        mills_present += [m for m in sec_df['_mill'].unique()
+                          if m not in MILL_ORDER]
 
-            for sub_mill, sub_df in sub_groups.items():
-                if sub_df.empty:
-                    continue
-                sorted_df = sort_section(sub_df)
-                out.append({
-                    'section_key': section_key,
-                    'mill':        sub_mill,
-                    'label':       build_section_label(section_key, sub_mill),
-                    'coils_df':    sorted_df,
-                })
+        for mill in mills_present:
+            mill_df = sec_df[sec_df['_mill'] == mill]
+            if mill_df.empty:
+                continue
+            sorted_df = sort_section(mill_df)
+            out.append({
+                'section_key': section_key,
+                'mill':        mill,
+                'label':       build_section_label(section_key, mill),
+                'coils_df':    sorted_df,
+            })
 
     return out
 
