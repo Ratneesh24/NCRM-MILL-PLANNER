@@ -43,7 +43,8 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["📋 Generate Plan", "🧠 Learn from Corrections",
-         "📊 Stats & Rules", "⚙️ Roll Optimiser"],
+         "📊 Stats & Rules", "⚙️ Roll Optimiser",
+         "🔩 Roll Life Tracker", "📐 Width Programme"],
         label_visibility="collapsed",
     )
 
@@ -77,7 +78,7 @@ if page == "📋 Generate Plan":
         )
     with col2:
         plan_date = st.date_input("Planning date", value=date.today())
-        days      = st.number_input("Days to generate", min_value=1, max_value=7, value=1)
+
         use_db    = st.checkbox("Apply learned rules", value=True)
 
     if wip_file and st.button("🚀 Generate Plan", type="primary", use_container_width=True):
@@ -97,7 +98,7 @@ if page == "📋 Generate Plan":
                         wip_file    = wip_path,
                         plan_date   = plan_date.strftime("%Y-%m-%d"),
                         output_file = out_path,
-                        days        = int(days),
+                        days        = 1,
                         learning_db = learning_db,
                         verbose     = True,
                     )
@@ -600,3 +601,329 @@ elif page == "⚙️ Roll Optimiser":
                             frozenset([r1, r2]), 45)
             st.dataframe(pd.DataFrame(matrix), use_container_width=True)
             st.caption("Values in minutes. Source: CRM Sahibabad historical changeover data.")
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE 5 — ROLL LIFE TRACKER
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "🔩 Roll Life Tracker":
+    import pandas as pd
+    from roll_life import (analyse_roll_life, RollState,
+                           DEFAULT_ROLL_LIFE, ROLL_TYPE)
+
+    st.title("🔩 Roll Life Tracker")
+    st.caption(
+        "Enter the current roll status on each mill, upload today's WIP, "
+        "and see exactly where each roll will exhaust — before it happens on the floor."
+    )
+
+    # ── Roll status input ─────────────────────────────────────────────
+    st.subheader("Current Roll Status")
+    st.info("Enter the roll type currently mounted and how many MT have already been rolled on it this campaign.")
+
+    ROLL_TYPES_CRM04 = ['LIGHT_MATT', 'BRIGHT', 'SUPER_BRIGHT', 'CHROME_PLATED']
+    ROLL_TYPES_CRM06 = ['LIGHT_MATT', 'BRIGHT', 'HEAVY_MATT']
+
+    col04, col06 = st.columns(2)
+    with col04:
+        st.markdown("**CRM-04**")
+        r04_type = st.selectbox("Roll type on CRM04", ROLL_TYPES_CRM04, key="r04t")
+        r04_used = st.number_input("MT already rolled on this roll",
+                                    min_value=0.0, max_value=500.0,
+                                    value=0.0, step=5.0, key="r04u")
+        r04_life = st.number_input("Roll life (MT) — leave 0 for default",
+                                    min_value=0.0, max_value=1000.0,
+                                    value=float(DEFAULT_ROLL_LIFE['CRM04'].get(r04_type, 180)),
+                                    step=10.0, key="r04l")
+        r04_num  = st.text_input("Roll number (optional)", key="r04n")
+
+    with col06:
+        st.markdown("**CRM-06**")
+        r06_type = st.selectbox("Roll type on CRM06", ROLL_TYPES_CRM06, key="r06t")
+        r06_used = st.number_input("MT already rolled on this roll",
+                                    min_value=0.0, max_value=500.0,
+                                    value=0.0, step=5.0, key="r06u")
+        r06_life = st.number_input("Roll life (MT) — leave 0 for default",
+                                    min_value=0.0, max_value=1000.0,
+                                    value=float(DEFAULT_ROLL_LIFE['CRM06'].get(r06_type, 160)),
+                                    step=10.0, key="r06l")
+        r06_num  = st.text_input("Roll number (optional)", key="r06n")
+
+    st.divider()
+    wip_rl = st.file_uploader("Upload WIP file", type=["xlsx"], key="wip_rl")
+
+    if wip_rl and st.button("🔍 Analyse Roll Life", type="primary",
+                             use_container_width=True):
+        with st.spinner("Simulating roll campaigns…"):
+            try:
+                import tempfile, os
+                from generator import load_wip, filter_rolling_coils, \
+                                       assign_all, build_sections
+
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+                    tmp.write(wip_rl.read()); wip_path = tmp.name
+
+                df       = load_wip(wip_path)
+                eligible = filter_rolling_coils(df)
+                assigned = assign_all(eligible, load_db())
+                sections = build_sections(assigned, load_db())
+                os.unlink(wip_path)
+
+                crm04_state = RollState(
+                    mill='CRM04', roll_type=r04_type,
+                    mt_used=r04_used,
+                    mt_life=r04_life or DEFAULT_ROLL_LIFE['CRM04'].get(r04_type, 180),
+                    roll_number=r04_num,
+                )
+                crm06_state = RollState(
+                    mill='CRM06', roll_type=r06_type,
+                    mt_used=r06_used,
+                    mt_life=r06_life or DEFAULT_ROLL_LIFE['CRM06'].get(r06_type, 160),
+                    roll_number=r06_num,
+                )
+
+                rl = analyse_roll_life(sections, crm04_state, crm06_state)
+                s  = rl['summary']
+
+                # ── Status banner ─────────────────────────────────────
+                STATUS_FN = {
+                    'CRITICAL': st.error,
+                    'WARNING':  st.warning,
+                    'OK':       st.success,
+                }
+                STATUS_FN.get(s['status'], st.info)(
+                    f"Roll Status: **{s['status']}** — "
+                    f"{s['critical_count']} critical, "
+                    f"{s['warning_count']} warnings"
+                )
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("CRM04 roll changes", s['crm04_roll_changes'])
+                k2.metric("CRM04 total MT",     f"{s['total_mt_crm04']:.1f}")
+                k3.metric("CRM06 roll changes", s['crm06_roll_changes'])
+                k4.metric("CRM06 total MT",     f"{s['total_mt_crm06']:.1f}")
+
+                st.divider()
+
+                # ── Campaign breakdown ────────────────────────────────
+                for mill_label, campaigns in [
+                    ("CRM-04", rl['crm04_campaigns']),
+                    ("CRM-06", rl['crm06_campaigns']),
+                ]:
+                    st.subheader(f"{mill_label} — Roll Campaigns")
+                    if not campaigns:
+                        st.info("No campaigns found.")
+                        continue
+
+                    rows = []
+                    for c in campaigns:
+                        status_icon = {
+                            'CRITICAL': '🔴', 'WARNING': '🟡',
+                            'MONITOR': '🟠', 'OK': '🟢'
+                        }.get(c['status'], '⚪')
+                        rows.append({
+                            "Status":       f"{status_icon} {c['status']}",
+                            "Roll Type":    c['roll_type'],
+                            "Sections":     ', '.join(
+                                s.replace('_',' ').title() for s in c['sections']),
+                            "MT Planned":   c['total_mt'],
+                            "MT Used Start":c['start_mt_used'],
+                            "MT Used End":  c['end_mt_used'],
+                            "Roll Life":    c['mt_life'],
+                            "% Consumed":   f"{c['pct_consumed']:.0f}%",
+                            "Exhausts At":  c['exhausts_at'] or '—',
+                        })
+                    st.dataframe(pd.DataFrame(rows),
+                                 use_container_width=True, hide_index=True)
+
+                # ── Critical warnings with actions ────────────────────
+                critical_warns = [w for w in rl['all_warnings']
+                                  if w.get('severity') == 'CRITICAL']
+                if critical_warns:
+                    st.divider()
+                    st.subheader("🔴 Critical Warnings & Actions")
+                    for w in critical_warns:
+                        with st.expander(f"⚠️ {w['message'][:80]}…", expanded=True):
+                            st.error(w['message'])
+                            if 'recommendation' in w:
+                                st.info(f"**Recommended Action:** {w['recommendation']}")
+                            if 'mt_overrun' in w and w['mt_overrun'] > 0:
+                                st.warning(
+                                    f"Roll overrun: **{w['mt_overrun']:.1f} MT** "
+                                    f"beyond rated life — risk of surface damage "
+                                    f"and strip quality defects."
+                                )
+
+                # ── Roll life reference table ─────────────────────────
+                with st.expander("📖 Default Roll Life Reference"):
+                    ref_rows = []
+                    for mill, types in DEFAULT_ROLL_LIFE.items():
+                        for rt, life in types.items():
+                            ref_rows.append({
+                                "Mill": mill, "Roll Type": rt,
+                                "Default Life (MT)": life
+                            })
+                    st.dataframe(pd.DataFrame(ref_rows),
+                                 use_container_width=True, hide_index=True)
+                    st.caption("Update these values to match your actual roll specifications.")
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+                import traceback; st.code(traceback.format_exc())
+
+    elif not wip_rl:
+        st.info("👆 Enter roll status above, then upload the WIP file to analyse.")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE 6 — WIDTH PROGRAMME OPTIMISER
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "📐 Width Programme":
+    import pandas as pd
+    from width_programme import analyse_width_programme
+
+    st.title("📐 Width Programme Optimiser")
+    st.caption(
+        "Analyses the width profile across all sections — finds poor width "
+        "transitions, cascade violations, and cross-section merge opportunities "
+        "to reduce roll edge stress and extend roll life."
+    )
+
+    wip_wp = st.file_uploader("Upload WIP file", type=["xlsx"], key="wip_wp")
+
+    if wip_wp and st.button("📐 Analyse Width Programme",
+                             type="primary", use_container_width=True):
+        with st.spinner("Analysing width programme…"):
+            try:
+                import tempfile, os
+                from generator import load_wip, filter_rolling_coils, \
+                                       assign_all, build_sections
+
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+                    tmp.write(wip_wp.read()); wip_path = tmp.name
+
+                df       = load_wip(wip_path)
+                eligible = filter_rolling_coils(df)
+                assigned = assign_all(eligible, load_db())
+                sections = build_sections(assigned, load_db())
+                os.unlink(wip_path)
+
+                wp = analyse_width_programme(sections)
+                sm = wp['summary']
+
+                # ── Programme score ───────────────────────────────────
+                score  = wp['programme_score']
+                rating = wp['programme_rating']
+                COLOR  = {'EXCELLENT':'🟢','GOOD':'🟢','FAIR':'🟡','POOR':'🔴'}
+                score_fn = st.success if score >= 65 else \
+                           st.warning if score >= 45 else st.error
+                score_fn(
+                    f"{COLOR.get(rating,'⚪')} Width Programme Score: "
+                    f"**{score}/100 ({rating})**"
+                )
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Total transitions",    sm['n_transitions'])
+                k2.metric("Poor transitions",     sm['poor_transitions'],
+                          delta_color="inverse",
+                          delta=f"-{sm['poor_transitions']}" if sm['poor_transitions'] else None)
+                k3.metric("Cascade violations",   sm['cascade_violations'],
+                          delta_color="inverse")
+                k4.metric("Merge opportunities",  sm['merge_opportunities'],
+                          delta_color="normal")
+
+                st.divider()
+
+                # ── Transition matrix heat-map ─────────────────────────
+                st.subheader("Section Transition Matrix")
+                st.caption("Each row = one section handoff. Lower score = better transition.")
+
+                t_rows = []
+                for t in wp['transitions']:
+                    rating_icon = {
+                        'POOR':'🔴','FAIR':'🟡',
+                        'GOOD':'🟢','EXCELLENT':'🟢'
+                    }.get(t['rating'],'⚪')
+                    t_rows.append({
+                        "From Section":    t['from_section'].replace('_',' ').title(),
+                        "To Section":      t['to_section'].replace('_',' ').title(),
+                        "Roll Change":     f"{t['roll_change_min']} min" if t['roll_change_min'] else "—",
+                        "Width Gap (mm)":  t['width_gap_mm'],
+                        "Direction":       t['width_direction'],
+                        "Score":           t['total_score'],
+                        "Rating":          f"{rating_icon} {t['rating']}",
+                    })
+                t_df = pd.DataFrame(t_rows)
+                st.dataframe(t_df, use_container_width=True, hide_index=True)
+
+                # ── Width profile chart per section ───────────────────
+                st.subheader("Width Profile Across Sections")
+                chart_rows = []
+                for s in sections:
+                    for _, row in s['coils_df'].iterrows():
+                        chart_rows.append({
+                            'Section': s['section_key'].replace('_',' ').title()[:15],
+                            'Width':   float(row['Actual Width']),
+                        })
+                if chart_rows:
+                    chart_df = pd.DataFrame(chart_rows)
+                    import plotly.express as px
+                    try:
+                        fig = px.box(
+                            chart_df, x='Section', y='Width',
+                            color='Section',
+                            title='Width Distribution by Section',
+                            labels={'Width': 'Width (mm)'},
+                        )
+                        fig.update_layout(showlegend=False, height=400)
+                        st.plotly_chart(fig, use_container_width=True)
+                    except ImportError:
+                        st.bar_chart(
+                            chart_df.groupby('Section')['Width'].mean()
+                        )
+
+                st.divider()
+
+                # ── Recommendations ───────────────────────────────────
+                st.subheader("💡 Recommendations")
+                sev_order = {'HIGH': 0, 'MEDIUM': 1, 'INFO': 2}
+                recs = sorted(wp['recommendations'],
+                              key=lambda r: sev_order.get(r['severity'], 3))
+
+                if not recs:
+                    st.success("No issues found — width programme is well-structured.")
+                else:
+                    for r in recs:
+                        sev_icon = {'HIGH':'🔴','MEDIUM':'🟡','INFO':'🔵'}.get(
+                            r['severity'],'⚪')
+                        expanded = r['severity'] == 'HIGH'
+                        with st.expander(f"{sev_icon}  {r['title']}", expanded=expanded):
+                            st.code(r['detail'], language='text')
+                            st.info(f"**Suggestion:** {r['suggestion']}")
+
+                # ── Width band group analysis ─────────────────────────
+                st.divider()
+                st.subheader("Cross-Section Width Band Groups")
+                st.caption(
+                    "Sections that share the same width band AND roll type "
+                    "are candidates for running as one continuous programme."
+                )
+                for band, groups in wp['band_groups'].items():
+                    if not groups:
+                        continue
+                    with st.expander(f"**{band}** width band ({len(groups)} section(s))"):
+                        g_df = pd.DataFrame([{
+                            "Section":   g['section'].replace('_',' ').title(),
+                            "Mill":      g['mill'],
+                            "Roll Type": g['roll_type'],
+                            "Coils":     g['coils'],
+                            "MT":        g['mt'],
+                            "Width Range": f"{g['min_width']:.0f}–{g['max_width']:.0f} mm",
+                        } for g in groups])
+                        st.dataframe(g_df, use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+                import traceback; st.code(traceback.format_exc())
+
+    elif not wip_wp:
+        st.info("👆 Upload the WIP file to analyse the width programme.")
