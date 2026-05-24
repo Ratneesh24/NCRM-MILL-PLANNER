@@ -1069,7 +1069,7 @@ elif page == "🏭 Shift Execution":
         with col_s3:
             shift_mill = st.selectbox("Mill", ["CRM04", "CRM06"], key="smil")
         with col_s4:
-            operator_name = st.text_input("Operator name", key="sop",
+            operator_name = st.text_input("Shift Incharge name", key="sop",
                                            placeholder="optional")
 
         # Load saved shift or show setup
