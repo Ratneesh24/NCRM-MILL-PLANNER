@@ -23,8 +23,16 @@ import os
 from datetime import datetime, date
 from typing import List, Dict, Optional
 
-_SHIFT_KEY_PREFIX = "shift_exec_"
-_LOCAL_SHIFT_DIR  = "/tmp/shifts"
+_SHIFT_KEY_PREFIX      = "shift_exec_"
+_SHIFT_KEY_PREFIX_TEST = "TEST_shift_exec_"
+_LOCAL_SHIFT_DIR       = "/tmp/shifts"
+
+def _shift_prefix() -> str:
+    try:
+        from db import is_test_mode
+        return _SHIFT_KEY_PREFIX_TEST if is_test_mode() else _SHIFT_KEY_PREFIX
+    except Exception:
+        return _SHIFT_KEY_PREFIX
 
 SHIFT_NAMES = {1: "Shift 1 (06:00–14:00)",
                2: "Shift 2 (14:00–22:00)",
@@ -40,13 +48,12 @@ COIL_STATUS = {
 
 
 def _shift_key(plan_date: str, mill: str, shift_no: int) -> str:
-    return f"{_SHIFT_KEY_PREFIX}{plan_date}_{mill}_S{shift_no}"
+    return f"{_shift_prefix()}{plan_date}_{mill}_S{shift_no}"
 
 
 def _local_path(key: str) -> str:
     os.makedirs(_LOCAL_SHIFT_DIR, exist_ok=True)
     return os.path.join(_LOCAL_SHIFT_DIR, f"{key}.json")
-
 
 def _get_client():
     """Reuse client from db.py."""
@@ -181,7 +188,7 @@ def list_recent_shifts(days_back: int = 7) -> List[Dict]:
         try:
             resp = (client.table("learning_db")
                           .select("key,data,updated_at")
-                          .like("key", f"{_SHIFT_KEY_PREFIX}%")
+                          .like("key", f"{_shift_prefix()}%")
                           .order("updated_at", desc=True)
                           .limit(50)
                           .execute())
