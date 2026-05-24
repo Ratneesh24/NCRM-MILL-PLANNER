@@ -20,8 +20,28 @@ Fallback: if env vars absent or connection fails, uses /tmp/learning_db.json
 import json
 import os
 from datetime import datetime
+from typing import Tuple
 
-_ROW_KEY = "mill_planner_v1"
+# ── Test mode — set to True to use test_ prefixed keys ─────────────────────
+# Controlled via Streamlit session state, never touches production keys
+_TEST_MODE = False   # module-level flag; toggled by set_test_mode()
+
+_ROW_KEY_PROD = "mill_planner_v1"
+_ROW_KEY_TEST = "TEST_mill_planner_v1"
+
+def set_test_mode(enabled: bool):
+    """Call this from app.py when the user toggles test mode."""
+    global _TEST_MODE
+    _TEST_MODE = enabled
+
+def is_test_mode() -> bool:
+    return _TEST_MODE
+
+def _row_key() -> str:
+    return _ROW_KEY_TEST if _TEST_MODE else _ROW_KEY_PROD
+
+# Keep _ROW_KEY as alias for anything that still references it directly
+_ROW_KEY = _ROW_KEY_PROD
 
 try:
     from supabase import create_client
@@ -136,7 +156,7 @@ def load_db() -> dict:
         try:
             resp = (client.table("learning_db")
                           .select("data")
-                          .eq("key", _ROW_KEY)
+                          .eq("key", _row_key())
                           .execute())
             if resp.data:
                 return _merge_empty(resp.data[0]["data"])
@@ -165,7 +185,7 @@ def save_db(db: dict) -> bool:
     if client:
         try:
             client.table("learning_db").upsert({
-                "key":        _ROW_KEY,
+                "key":        _row_key(),
                 "data":       db,
                 "updated_at": db["last_updated"],
             }).execute()
@@ -216,6 +236,10 @@ def get_storage_mode() -> str:
 # ── Roll State Persistence ──────────────────────────────────────────────────
 # Stored as a separate key in the same learning_db table
 _ROLL_STATE_KEY   = "roll_state_v1"
+_ROLL_STATE_KEY_TEST = "TEST_roll_state_v1"
+
+def _roll_state_key() -> str:
+    return _ROLL_STATE_KEY_TEST if _TEST_MODE else _ROLL_STATE_KEY
 _ROLL_STATE_LOCAL = "/tmp/roll_state.json"
 
 EMPTY_ROLL_STATE = {
@@ -249,7 +273,7 @@ def load_roll_state() -> dict:
         try:
             resp = (client.table("learning_db")
                           .select("data")
-                          .eq("key", _ROLL_STATE_KEY)
+                          .eq("key", _roll_state_key())
                           .execute())
             if resp.data:
                 saved = resp.data[0]["data"]
@@ -314,7 +338,7 @@ def save_roll_state(state: dict, plan_date: str = "",
     if client:
         try:
             client.table("learning_db").upsert({
-                "key":        _ROLL_STATE_KEY,
+                "key":        _roll_state_key(),
                 "data":       state,
                 "updated_at": now,
             }).execute()
@@ -361,3 +385,77 @@ def record_roll_change(mill: str, new_roll_type: str,
     ms["installed_date"] = installed_date or now[:10]
     ms["last_updated"]   = now
     return save_roll_state(state)
+
+
+# ── Test Mode Utilities ─────────────────────────────────────────────────────
+
+def clear_test_data() -> Tuple[int, str]:
+    """
+    Delete all records whose key starts with 'TEST_' from Supabase and local.
+    Returns (count_deleted, message).
+    """
+    deleted = 0
+    msg     = ""
+
+    client = _get_client()
+    if client:
+        try:
+            # Fetch all TEST_ keys first
+            resp = (client.table("learning_db")
+                          .select("key")
+                          .like("key", "TEST_%")
+                          .execute())
+            keys = [r["key"] for r in resp.data]
+            if keys:
+                client.table("learning_db") \
+                      .delete() \
+                      .like("key", "TEST_%") \
+                      .execute()
+                deleted = len(keys)
+                msg = f"Deleted {deleted} test record(s) from Supabase: {keys}"
+            else:
+                msg = "No test records found in Supabase."
+        except Exception as e:
+            msg = f"Supabase delete error: {e}"
+
+    # Clear local test files
+    local_files = [
+        "/tmp/learning_db.json",
+        "/tmp/roll_state.json",
+    ]
+    for lf in local_files:
+        test_lf = lf.replace(".json", "_TEST.json")
+        if os.path.exists(test_lf):
+            os.remove(test_lf)
+
+    # Clear test shift files
+    shift_dir = "/tmp/shifts"
+    if os.path.exists(shift_dir):
+        import glob
+        test_shifts = glob.glob(os.path.join(shift_dir, "TEST_*.json"))
+        for ts in test_shifts:
+            os.remove(ts)
+        deleted += len(test_shifts)
+
+    return deleted, msg
+
+
+def get_db_stats() -> dict:
+    """Return count of production vs test records in Supabase."""
+    client = _get_client()
+    if not client:
+        return {"error": "Not connected", "prod": 0, "test": 0, "total": 0}
+    try:
+        all_resp = client.table("learning_db").select("key").execute()
+        all_keys = [r["key"] for r in all_resp.data]
+        test_keys = [k for k in all_keys if k.startswith("TEST_")]
+        prod_keys = [k for k in all_keys if not k.startswith("TEST_")]
+        return {
+            "total": len(all_keys),
+            "prod":  len(prod_keys),
+            "test":  len(test_keys),
+            "prod_keys": prod_keys,
+            "test_keys": test_keys,
+        }
+    except Exception as e:
+        return {"error": str(e), "prod": 0, "test": 0, "total": 0}
