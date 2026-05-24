@@ -609,55 +609,116 @@ elif page == "🔩 Roll Life Tracker":
     import pandas as pd
     from roll_life import (analyse_roll_life, RollState,
                            DEFAULT_ROLL_LIFE, ROLL_TYPE)
+    from db import (load_roll_state, save_roll_state,
+                    record_roll_change, EMPTY_ROLL_STATE)
 
     st.title("🔩 Roll Life Tracker")
     st.caption(
-        "Enter the current roll status on each mill, upload today's WIP, "
-        "and see exactly where each roll will exhaust — before it happens on the floor."
+        "Roll state is remembered across shifts. "
+        "Update only what changed — the rest is pre-filled from yesterday."
     )
 
-    # ── Roll status input ─────────────────────────────────────────────
-    st.subheader("Current Roll Status")
-    st.info("Enter the roll type currently mounted and how many MT have already been rolled on it this campaign.")
+    # ── Load persisted state ──────────────────────────────────────────
+    roll_state = load_roll_state()
+    rs04 = roll_state.get("CRM04", dict(EMPTY_ROLL_STATE["CRM04"]))
+    rs06 = roll_state.get("CRM06", dict(EMPTY_ROLL_STATE["CRM06"]))
 
-    ROLL_TYPES_CRM04 = ['LIGHT_MATT', 'BRIGHT', 'SUPER_BRIGHT', 'CHROME_PLATED']
-    ROLL_TYPES_CRM06 = ['LIGHT_MATT', 'BRIGHT', 'HEAVY_MATT']
+    ROLL_TYPES_CRM04 = ["LIGHT_MATT", "BRIGHT", "SUPER_BRIGHT", "CHROME_PLATED"]
+    ROLL_TYPES_CRM06 = ["LIGHT_MATT", "BRIGHT", "HEAVY_MATT"]
+
+    # ── Last updated badge ────────────────────────────────────────────
+    last_upd = rs04.get("last_plan_date") or rs04.get("last_updated", "")
+    if last_upd:
+        st.info(f"📅  Last saved: **{last_upd[:10]}**  |  "
+                f"CRM04 roll: **{rs04.get('roll_type','-')}** "
+                f"({rs04.get('mt_used',0):.1f} / {rs04.get('mt_life',0):.0f} MT used)  |  "
+                f"CRM06 roll: **{rs06.get('roll_type','-')}** "
+                f"({rs06.get('mt_used',0):.1f} / {rs06.get('mt_life',0):.0f} MT used)")
+    else:
+        st.warning("No saved roll state found — please enter today's roll details below.")
+
+    st.divider()
+
+    # ── Roll status input (pre-filled from saved state) ───────────────
+    st.subheader("Current Roll Status")
 
     col04, col06 = st.columns(2)
+
     with col04:
         st.markdown("**CRM-04**")
-        r04_type = st.selectbox("Roll type on CRM04", ROLL_TYPES_CRM04, key="r04t")
-        r04_used = st.number_input("MT already rolled on this roll",
-                                    min_value=0.0, max_value=500.0,
-                                    value=0.0, step=5.0, key="r04u")
-        r04_life = st.number_input("Roll life (MT) — leave 0 for default",
+        idx04 = ROLL_TYPES_CRM04.index(rs04.get("roll_type","LIGHT_MATT"))                 if rs04.get("roll_type") in ROLL_TYPES_CRM04 else 0
+        r04_type = st.selectbox("Roll type", ROLL_TYPES_CRM04,
+                                 index=idx04, key="r04t")
+        r04_used = st.number_input("MT already used on this roll",
                                     min_value=0.0, max_value=1000.0,
-                                    value=float(DEFAULT_ROLL_LIFE['CRM04'].get(r04_type, 180)),
+                                    value=float(rs04.get("mt_used", 0.0)),
+                                    step=5.0, key="r04u",
+                                    help="Pre-filled from last session. Adjust if needed.")
+        r04_life = st.number_input("Roll life (MT total)",
+                                    min_value=10.0, max_value=2000.0,
+                                    value=float(rs04.get("mt_life",
+                                        DEFAULT_ROLL_LIFE["CRM04"].get(r04_type, 180))),
                                     step=10.0, key="r04l")
-        r04_num  = st.text_input("Roll number (optional)", key="r04n")
+        r04_num  = st.text_input("Roll number", value=rs04.get("roll_number",""),
+                                  key="r04n")
+
+        # Roll change button
+        with st.expander("🔄 Record a Roll Change on CRM04"):
+            st.caption("Use this when you physically changed the roll on CRM04.")
+            new04_type = st.selectbox("New roll type", ROLL_TYPES_CRM04, key="new04t")
+            new04_life = st.number_input("New roll life (MT)",
+                                          value=float(DEFAULT_ROLL_LIFE["CRM04"].get(
+                                              new04_type, 180)),
+                                          step=10.0, key="new04l")
+            new04_num  = st.text_input("New roll number", key="new04n")
+            if st.button("✅ Confirm CRM04 Roll Change", key="chg04"):
+                record_roll_change("CRM04", new04_type, new04_life,
+                                   new04_num, date.today().isoformat())
+                st.success(f"CRM04 roll changed to {new04_type}. MT reset to 0.")
+                st.rerun()
 
     with col06:
         st.markdown("**CRM-06**")
-        r06_type = st.selectbox("Roll type on CRM06", ROLL_TYPES_CRM06, key="r06t")
-        r06_used = st.number_input("MT already rolled on this roll",
-                                    min_value=0.0, max_value=500.0,
-                                    value=0.0, step=5.0, key="r06u")
-        r06_life = st.number_input("Roll life (MT) — leave 0 for default",
+        idx06 = ROLL_TYPES_CRM06.index(rs06.get("roll_type","LIGHT_MATT"))                 if rs06.get("roll_type") in ROLL_TYPES_CRM06 else 0
+        r06_type = st.selectbox("Roll type", ROLL_TYPES_CRM06,
+                                 index=idx06, key="r06t")
+        r06_used = st.number_input("MT already used on this roll",
                                     min_value=0.0, max_value=1000.0,
-                                    value=float(DEFAULT_ROLL_LIFE['CRM06'].get(r06_type, 160)),
+                                    value=float(rs06.get("mt_used", 0.0)),
+                                    step=5.0, key="r06u",
+                                    help="Pre-filled from last session. Adjust if needed.")
+        r06_life = st.number_input("Roll life (MT total)",
+                                    min_value=10.0, max_value=2000.0,
+                                    value=float(rs06.get("mt_life",
+                                        DEFAULT_ROLL_LIFE["CRM06"].get(r06_type, 160))),
                                     step=10.0, key="r06l")
-        r06_num  = st.text_input("Roll number (optional)", key="r06n")
+        r06_num  = st.text_input("Roll number", value=rs06.get("roll_number",""),
+                                  key="r06n")
+
+        with st.expander("🔄 Record a Roll Change on CRM06"):
+            st.caption("Use this when you physically changed the roll on CRM06.")
+            new06_type = st.selectbox("New roll type", ROLL_TYPES_CRM06, key="new06t")
+            new06_life = st.number_input("New roll life (MT)",
+                                          value=float(DEFAULT_ROLL_LIFE["CRM06"].get(
+                                              new06_type, 160)),
+                                          step=10.0, key="new06l")
+            new06_num  = st.text_input("New roll number", key="new06n")
+            if st.button("✅ Confirm CRM06 Roll Change", key="chg06"):
+                record_roll_change("CRM06", new06_type, new06_life,
+                                   new06_num, date.today().isoformat())
+                st.success(f"CRM06 roll changed to {new06_type}. MT reset to 0.")
+                st.rerun()
 
     st.divider()
+
     wip_rl = st.file_uploader("Upload WIP file", type=["xlsx"], key="wip_rl")
 
-    if wip_rl and st.button("🔍 Analyse Roll Life", type="primary",
-                             use_container_width=True):
+    if wip_rl and st.button("🔍 Analyse & Save Roll State",
+                             type="primary", use_container_width=True):
         with st.spinner("Simulating roll campaigns…"):
             try:
-                import tempfile, os
-                from generator import load_wip, filter_rolling_coils, \
-                                       assign_all, build_sections
+                import tempfile, os as _os
+                from generator import load_wip, filter_rolling_coils,                                        assign_all, build_sections
 
                 with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
                     tmp.write(wip_rl.read()); wip_path = tmp.name
@@ -666,113 +727,154 @@ elif page == "🔩 Roll Life Tracker":
                 eligible = filter_rolling_coils(df)
                 assigned = assign_all(eligible, load_db())
                 sections = build_sections(assigned, load_db())
-                os.unlink(wip_path)
+                _os.unlink(wip_path)
 
                 crm04_state = RollState(
-                    mill='CRM04', roll_type=r04_type,
-                    mt_used=r04_used,
-                    mt_life=r04_life or DEFAULT_ROLL_LIFE['CRM04'].get(r04_type, 180),
+                    mill="CRM04", roll_type=r04_type,
+                    mt_used=r04_used, mt_life=r04_life,
                     roll_number=r04_num,
                 )
                 crm06_state = RollState(
-                    mill='CRM06', roll_type=r06_type,
-                    mt_used=r06_used,
-                    mt_life=r06_life or DEFAULT_ROLL_LIFE['CRM06'].get(r06_type, 160),
+                    mill="CRM06", roll_type=r06_type,
+                    mt_used=r06_used, mt_life=r06_life,
                     roll_number=r06_num,
                 )
 
                 rl = analyse_roll_life(sections, crm04_state, crm06_state)
-                s  = rl['summary']
+                s  = rl["summary"]
+
+                # ── Save updated state to Supabase ────────────────────
+                # Update the in-memory state with current form values
+                roll_state["CRM04"].update({
+                    "roll_type":   r04_type,
+                    "mt_used":     r04_used,
+                    "mt_life":     r04_life,
+                    "roll_number": r04_num,
+                })
+                roll_state["CRM06"].update({
+                    "roll_type":   r06_type,
+                    "mt_used":     r06_used,
+                    "mt_life":     r06_life,
+                    "roll_number": r06_num,
+                })
+
+                # MT planned today (what will be rolled) per mill
+                crm04_planned_mt = s.get("total_mt_crm04", 0.0)
+                crm06_planned_mt = s.get("total_mt_crm06", 0.0)
+
+                saved = save_roll_state(
+                    roll_state,
+                    plan_date       = opt_date.isoformat()
+                                      if "opt_date" in dir() else
+                                      date.today().isoformat(),
+                    crm04_mt_rolled = 0.0,   # will increment when plan executed
+                    crm06_mt_rolled = 0.0,
+                )
+
+                st.success(
+                    f"✅ Roll state saved ({'☁️ Supabase' if is_supabase_connected() else '💾 Local'})  |  "
+                    f"CRM04 planned: **{crm04_planned_mt:.1f} MT**  |  "
+                    f"CRM06 planned: **{crm06_planned_mt:.1f} MT**"
+                )
 
                 # ── Status banner ─────────────────────────────────────
-                STATUS_FN = {
-                    'CRITICAL': st.error,
-                    'WARNING':  st.warning,
-                    'OK':       st.success,
-                }
-                STATUS_FN.get(s['status'], st.info)(
+                STATUS_FN = {"CRITICAL": st.error,
+                             "WARNING":  st.warning,
+                             "OK":       st.success}
+                STATUS_FN.get(s["status"], st.info)(
                     f"Roll Status: **{s['status']}** — "
-                    f"{s['critical_count']} critical, "
-                    f"{s['warning_count']} warnings"
+                    f"{s['critical_count']} critical, {s['warning_count']} warnings"
                 )
 
                 k1, k2, k3, k4 = st.columns(4)
-                k1.metric("CRM04 roll changes", s['crm04_roll_changes'])
+                k1.metric("CRM04 roll changes", s["crm04_roll_changes"])
                 k2.metric("CRM04 total MT",     f"{s['total_mt_crm04']:.1f}")
-                k3.metric("CRM06 roll changes", s['crm06_roll_changes'])
+                k3.metric("CRM06 roll changes", s["crm06_roll_changes"])
                 k4.metric("CRM06 total MT",     f"{s['total_mt_crm06']:.1f}")
 
                 st.divider()
 
-                # ── Campaign breakdown ────────────────────────────────
+                # ── Campaign tables ───────────────────────────────────
                 for mill_label, campaigns in [
-                    ("CRM-04", rl['crm04_campaigns']),
-                    ("CRM-06", rl['crm06_campaigns']),
+                    ("CRM-04", rl["crm04_campaigns"]),
+                    ("CRM-06", rl["crm06_campaigns"]),
                 ]:
                     st.subheader(f"{mill_label} — Roll Campaigns")
                     if not campaigns:
                         st.info("No campaigns found.")
                         continue
-
                     rows = []
                     for c in campaigns:
-                        status_icon = {
-                            'CRITICAL': '🔴', 'WARNING': '🟡',
-                            'MONITOR': '🟠', 'OK': '🟢'
-                        }.get(c['status'], '⚪')
+                        icon = {"CRITICAL":"🔴","WARNING":"🟡",
+                                "MONITOR":"🟠","OK":"🟢"}.get(c["status"],"⚪")
                         rows.append({
-                            "Status":       f"{status_icon} {c['status']}",
-                            "Roll Type":    c['roll_type'],
-                            "Sections":     ', '.join(
-                                s.replace('_',' ').title() for s in c['sections']),
-                            "MT Planned":   c['total_mt'],
-                            "MT Used Start":c['start_mt_used'],
-                            "MT Used End":  c['end_mt_used'],
-                            "Roll Life":    c['mt_life'],
-                            "% Consumed":   f"{c['pct_consumed']:.0f}%",
-                            "Exhausts At":  c['exhausts_at'] or '—',
+                            "Status":        f"{icon} {c['status']}",
+                            "Roll Type":     c["roll_type"],
+                            "Sections":      ", ".join(
+                                s2.replace("_"," ").title() for s2 in c["sections"]),
+                            "MT Planned":    c["total_mt"],
+                            "MT Used Start": c["start_mt_used"],
+                            "MT Used End":   c["end_mt_used"],
+                            "Roll Life":     c["mt_life"],
+                            "% Consumed":    f"{c['pct_consumed']:.0f}%",
+                            "Exhausts At":   c["exhausts_at"] or "—",
                         })
                     st.dataframe(pd.DataFrame(rows),
                                  use_container_width=True, hide_index=True)
 
-                # ── Critical warnings with actions ────────────────────
-                critical_warns = [w for w in rl['all_warnings']
-                                  if w.get('severity') == 'CRITICAL']
-                if critical_warns:
+                # ── Critical warnings ─────────────────────────────────
+                criticals = [w for w in rl["all_warnings"]
+                             if w.get("severity") == "CRITICAL"]
+                if criticals:
                     st.divider()
-                    st.subheader("🔴 Critical Warnings & Actions")
-                    for w in critical_warns:
-                        with st.expander(f"⚠️ {w['message'][:80]}…", expanded=True):
-                            st.error(w['message'])
-                            if 'recommendation' in w:
-                                st.info(f"**Recommended Action:** {w['recommendation']}")
-                            if 'mt_overrun' in w and w['mt_overrun'] > 0:
+                    st.subheader("🔴 Critical Warnings")
+                    for w in criticals:
+                        with st.expander(f"⚠️ {w['message'][:80]}", expanded=True):
+                            st.error(w["message"])
+                            if "recommendation" in w:
+                                st.info(f"**Action:** {w['recommendation']}")
+                            if w.get("mt_overrun", 0) > 0:
                                 st.warning(
-                                    f"Roll overrun: **{w['mt_overrun']:.1f} MT** "
-                                    f"beyond rated life — risk of surface damage "
-                                    f"and strip quality defects."
-                                )
+                                    f"Overrun: **{w['mt_overrun']:.1f} MT** beyond rated life.")
 
-                # ── Roll life reference table ─────────────────────────
+                # ── Roll usage history chart ──────────────────────────
+                st.divider()
+                st.subheader("📈 Roll Usage History")
+                col_h04, col_h06 = st.columns(2)
+                for col, mill, ms in [(col_h04, "CRM04", rs04),
+                                       (col_h06, "CRM06", rs06)]:
+                    with col:
+                        hist = [h for h in ms.get("history", [])
+                                if "mt_used_end" in h]
+                        if hist:
+                            h_df = pd.DataFrame(hist)
+                            h_df["pct"] = (h_df["mt_used_end"] /
+                                           ms.get("mt_life", 1) * 100).clip(0, 100)
+                            st.markdown(f"**{mill}**")
+                            st.line_chart(
+                                h_df.set_index("date")["mt_used_end"],
+                                height=180,
+                            )
+                        else:
+                            st.markdown(f"**{mill}** — no history yet")
+
                 with st.expander("📖 Default Roll Life Reference"):
-                    ref_rows = []
-                    for mill, types in DEFAULT_ROLL_LIFE.items():
+                    ref = []
+                    for mill2, types in DEFAULT_ROLL_LIFE.items():
                         for rt, life in types.items():
-                            ref_rows.append({
-                                "Mill": mill, "Roll Type": rt,
-                                "Default Life (MT)": life
-                            })
-                    st.dataframe(pd.DataFrame(ref_rows),
+                            ref.append({"Mill": mill2,
+                                        "Roll Type": rt,
+                                        "Default Life (MT)": life})
+                    st.dataframe(pd.DataFrame(ref),
                                  use_container_width=True, hide_index=True)
-                    st.caption("Update these values to match your actual roll specifications.")
 
             except Exception as e:
                 st.error(f"Error: {e}")
                 import traceback; st.code(traceback.format_exc())
 
     elif not wip_rl:
-        st.info("👆 Enter roll status above, then upload the WIP file to analyse.")
-
+        st.info("👆 Roll status pre-filled from last session. "
+                "Adjust if needed, then upload WIP to analyse.")
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE 6 — WIDTH PROGRAMME OPTIMISER
