@@ -56,6 +56,28 @@ with st.sidebar:
     st.caption(f"Storage: {storage_mode}")
 
     st.divider()
+
+    # ── Test Mode toggle ──────────────────────────────────
+    from db import set_test_mode, is_test_mode
+    if "test_mode" not in st.session_state:
+        st.session_state["test_mode"] = False
+
+    test_on = st.toggle(
+        "🧪 Test Mode",
+        value=st.session_state["test_mode"],
+        help="When ON: all saves go to TEST_ keys. Real data is untouched.",
+        key="test_toggle",
+    )
+    if test_on != st.session_state["test_mode"]:
+        st.session_state["test_mode"] = test_on
+        set_test_mode(test_on)
+        st.rerun()
+    set_test_mode(test_on)
+
+    if test_on:
+        st.warning("🧪 TEST MODE ON\nData saves to TEST_ keys only.")
+
+    st.divider()
     db = load_db()
     st.metric("Sessions learned",    db.get("total_sessions", 0))
     acc = db.get("cumulative_accuracy", 0.0)
@@ -338,6 +360,34 @@ elif page == "📊 Stats & Rules":
                 save_db(db)
                 st.success(f"Saved: {key_in} → {sec_in} @ {mill_in}")
                 st.rerun()
+
+    st.divider()
+
+    # ── DB Management ─────────────────────────────────────────────────
+    st.subheader("🗄️ Database Management")
+    from db import get_db_stats, clear_test_data, is_test_mode
+
+    stats = get_db_stats()
+    if "error" not in stats:
+        dm1, dm2, dm3 = st.columns(3)
+        dm1.metric("Total records",  stats["total"])
+        dm2.metric("Production",     stats["prod"])
+        dm3.metric("Test records",   stats["test"],
+                   delta_color="off")
+
+        if stats["test"] > 0:
+            st.warning(f"🧪 {stats['test']} test record(s) in database: "
+                       f"{', '.join(stats['test_keys'][:5])}"
+                       f"{'…' if len(stats['test_keys']) > 5 else ''}")
+            if st.button("🗑️ Clear ALL test data", type="secondary",
+                          use_container_width=False):
+                n, msg = clear_test_data()
+                st.success(f"✅ {msg}")
+                st.rerun()
+        else:
+            st.success("✅ No test records — database is clean.")
+    else:
+        st.info(f"DB stats: {stats.get('error','Not connected')}")
 
     st.divider()
 
@@ -1069,7 +1119,7 @@ elif page == "🏭 Shift Execution":
         with col_s3:
             shift_mill = st.selectbox("Mill", ["CRM04", "CRM06"], key="smil")
         with col_s4:
-            operator_name = st.text_input("Shift Incharge name", key="sop",
+            operator_name = st.text_input("Operator name", key="sop",
                                            placeholder="optional")
 
         # Load saved shift or show setup
