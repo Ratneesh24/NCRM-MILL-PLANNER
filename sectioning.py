@@ -48,7 +48,7 @@ def assign_section_base(row):
     last_stage = _s(row.get('Last Production Stage')).upper()
 
     # ── Helper: pick mill from Work Center if available ────────────────
-    def _wc_mill(default):
+    def _wc_mill(default=None):
         if 'CRM04' in work_ctr:  return 'CRM04'
         if 'CRM06' in work_ctr:  return 'CRM06'
         return default
@@ -78,9 +78,13 @@ def assign_section_base(row):
 
     # ── 1. TUBE FULL HARD (TATFHC, C09, TR17) ──────────────────────────
     if quality == 'TATFHC' and prod_code == 'C09':
-        mill = 'CRM04' if 'CRM04' in work_ctr else \
-               'CRM06' if 'CRM06' in work_ctr else 'CRM04/06'
-        return 'TUBE_FH', mill
+        # Use work center if available; else split by width
+        if 'CRM04' in work_ctr or storage in {'R032', 'RP01', 'RP02'}:
+            return 'TUBE_FH', 'CRM04'
+        if 'CRM06' in work_ctr:
+            return 'TUBE_FH', 'CRM06'
+        # Width-based: RP02/wide coils → CRM04, narrow → CRM06
+        return 'TUBE_FH', ('CRM04' if thick <= 2.0 else 'CRM06')
 
     # ── 2. SKIN-PASS HEAVY MATT (TATBID / BD01) ───────────────────────
     if quality == 'TATBID' or tdc == 'BD01':
@@ -233,11 +237,15 @@ def assign_section_base(row):
         if ('RW-REWINDING' in next_stage or 'B-ANNEALING' in next_stage
                 or 'M-ROLLING' in next_stage or 'S-SPM' in next_stage
                 or '09-QA' in next_stage):
-            mill = _wc_mill('CRM04/06')
-            return 'ROLLING', mill
+            mill = _wc_mill(None)
+            if mill:
+                return 'ROLLING', mill
+            # Width-based split: wider coils → CRM04, narrower → CRM06
+            return 'ROLLING', ('CRM04' if thick >= 3.5 else 'CRM06')
 
     if prod_code == 'C01' and tdc == 'D012' and thick >= 3.5:
-        return 'ROLLING', 'CRM04/06'
+        mill = _wc_mill(None)
+        return 'ROLLING', mill if mill else 'CRM04'
 
     if prod_code == 'C01' and quality == 'TSBM55':
         return 'ROLLING', 'CRM04'
