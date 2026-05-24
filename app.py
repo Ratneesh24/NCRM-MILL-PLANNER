@@ -1064,7 +1064,7 @@ elif page == "🏭 Shift Execution":
         with col_s1:
             shift_date = st.date_input("Plan date", value=date.today(), key="sd")
         with col_s2:
-            shift_no = st.selectbox("Shift", [1, 2, 3],
+            shift_no = st.selectbox("Shift", [A, B, C],
                 format_func=lambda x: SHIFT_NAMES[x], key="sno")
         with col_s3:
             shift_mill = st.selectbox("Mill", ["CRM04", "CRM06"], key="smil")
