@@ -44,7 +44,8 @@ with st.sidebar:
         "Navigate",
         ["📋 Generate Plan", "🧠 Learn from Corrections",
          "📊 Stats & Rules", "⚙️ Roll Optimiser",
-         "🔩 Roll Life Tracker", "📐 Width Programme"],
+         "🔩 Roll Life Tracker", "📐 Width Programme",
+         "🏭 Shift Execution"],
         label_visibility="collapsed",
     )
 
@@ -1029,3 +1030,433 @@ elif page == "📐 Width Programme":
 
     elif not wip_wp:
         st.info("👆 Upload the WIP file to analyse the width programme.")
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE 7 — SHIFT EXECUTION TRACKER
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "🏭 Shift Execution":
+    import pandas as pd
+    from shift_tracker import (
+        build_shift_record, load_shift, save_shift,
+        confirm_coil, list_recent_shifts, get_shift_analytics,
+        COIL_STATUS, SHIFT_NAMES
+    )
+    from db import load_roll_state, save_roll_state, EMPTY_ROLL_STATE
+    from roll_life import DEFAULT_ROLL_LIFE
+
+    st.title("🏭 Shift Execution Tracker")
+    st.caption(
+        "Live coil-by-coil confirmation. Tap ✅ as each coil finishes rolling — "
+        "roll life and shift analytics update automatically."
+    )
+
+    # ── Top tabs ──────────────────────────────────────────────────────
+    tab_live, tab_history, tab_analytics = st.tabs(
+        ["▶️  Live Shift", "📋 Shift History", "📊 Analytics"])
+
+    # ════════════════════════════════════════════════════════
+    # TAB 1 — LIVE SHIFT
+    # ════════════════════════════════════════════════════════
+    with tab_live:
+
+        # ── Shift setup ───────────────────────────────────
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+        with col_s1:
+            shift_date = st.date_input("Plan date", value=date.today(), key="sd")
+        with col_s2:
+            shift_no = st.selectbox("Shift", [1, 2, 3],
+                format_func=lambda x: SHIFT_NAMES[x], key="sno")
+        with col_s3:
+            shift_mill = st.selectbox("Mill", ["CRM04", "CRM06"], key="smil")
+        with col_s4:
+            operator_name = st.text_input("Operator name", key="sop",
+                                           placeholder="optional")
+
+        # Load saved shift or show setup
+        shift_key_str = f"{shift_date.isoformat()}_{shift_mill}_S{shift_no}"
+        shift = load_shift(shift_date.isoformat(), shift_mill, shift_no)
+
+        if shift is None:
+            st.info("No active shift found for this date/mill/shift. "
+                    "Upload the WIP file to start a new shift.")
+            wip_shift = st.file_uploader("Upload WIP file to start shift",
+                                          type=["xlsx"], key="wip_shift")
+
+            # Roll type for this shift
+            rs = load_roll_state()
+            mill_rs = rs.get(shift_mill, EMPTY_ROLL_STATE[shift_mill])
+            RTYPES = (["LIGHT_MATT","BRIGHT","SUPER_BRIGHT","CHROME_PLATED"]
+                      if shift_mill == "CRM04"
+                      else ["LIGHT_MATT","BRIGHT","HEAVY_MATT"])
+            curr_rt = mill_rs.get("roll_type", RTYPES[0])
+            idx_rt  = RTYPES.index(curr_rt) if curr_rt in RTYPES else 0
+            shift_roll = st.selectbox(
+                f"Roll type on {shift_mill} at shift start",
+                RTYPES, index=idx_rt, key="srt",
+                help="Pre-filled from Roll Life Tracker. Change if roll was swapped.")
+
+            if wip_shift and st.button("▶️ Start Shift", type="primary",
+                                        use_container_width=True):
+                import tempfile, os as _os
+                from generator import load_wip, filter_rolling_coils, \
+                                       assign_all, build_sections
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
+                    t.write(wip_shift.read()); wip_path = t.name
+                df2      = load_wip(wip_path)
+                elig2    = filter_rolling_coils(df2)
+                asgn2    = assign_all(elig2, load_db())
+                secs2    = build_sections(asgn2, load_db())
+                _os.unlink(wip_path)
+
+                # Filter sections for this mill
+                mill_secs = [s for s in secs2 if s["mill"] == shift_mill]
+                if not mill_secs:
+                    st.error(f"No coils planned for {shift_mill} today.")
+                else:
+                    shift = build_shift_record(
+                        shift_date.isoformat(), shift_no,
+                        shift_mill, mill_secs, shift_roll)
+                    shift["operator_notes"] = operator_name
+                    save_shift(shift)
+                    st.success(f"Shift started! {shift['total_coils']} coils, "
+                               f"{shift['mt_target']:.1f} MT planned.")
+                    st.rerun()
+
+        else:
+            # ── Active shift dashboard ─────────────────────────────
+            mt_done    = shift.get("mt_rolled", 0)
+            mt_target  = shift.get("mt_target", 1)
+            pct_done   = min(100, mt_done / max(mt_target, 0.01) * 100)
+            n_rolled   = shift.get("coils_rolled", 0)
+            n_total    = shift.get("total_coils", 0)
+            n_pending  = sum(1 for c in shift["coils"] if c["status"] == "PENDING")
+            n_skipped  = shift.get("coils_skipped", 0)
+            n_hold     = shift.get("coils_on_hold", 0)
+
+            # ── KPI bar ───────────────────────────────────────────
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("MT Rolled",   f"{mt_done:.1f}")
+            k2.metric("MT Target",   f"{mt_target:.1f}")
+            k3.metric("Progress",    f"{pct_done:.1f}%")
+            k4.metric("Coils Done",  f"{n_rolled}/{n_total}")
+            k5.metric("Remaining",   n_pending,
+                      delta=f"{n_skipped} skipped / {n_hold} hold",
+                      delta_color="off")
+
+            st.progress(pct_done / 100)
+
+            # ── Shift info row ─────────────────────────────────────
+            si1, si2, si3 = st.columns(3)
+            si1.caption(f"🏭 **{shift_mill}**  |  {shift.get('shift_name')}")
+            si2.caption(f"🔩 Roll: **{shift.get('roll_type')}**")
+            si3.caption(f"🕐 Last update: {shift.get('last_updated','')[:16]}")
+
+            st.divider()
+
+            # ── Filter controls ────────────────────────────────────
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                show_status = st.multiselect(
+                    "Show status", list(COIL_STATUS.keys()),
+                    default=["PENDING","ON_HOLD"], key="fst")
+            with fc2:
+                show_section = st.multiselect(
+                    "Filter section", list({c["section_key"]
+                        for c in shift["coils"]}),
+                    default=[], key="fsec")
+            with fc3:
+                search_coil = st.text_input("Search coil / SO", key="sch")
+
+            # ── Coil list ──────────────────────────────────────────
+            filtered = [
+                c for c in shift["coils"]
+                if c["status"] in (show_status or list(COIL_STATUS.keys()))
+                and (not show_section or c["section_key"] in show_section)
+                and (not search_coil or
+                     search_coil.lower() in c["coil_number"].lower() or
+                     search_coil.lower() in c["so_no"].lower())
+            ]
+
+            if not filtered:
+                st.info("No coils match the current filter.")
+            else:
+                st.caption(f"Showing {len(filtered)} coils")
+
+                # Render coil cards — group by section
+                current_section = None
+                for coil in filtered:
+                    # Section divider
+                    if coil["section_key"] != current_section:
+                        current_section = coil["section_key"]
+                        sec_coils  = [c for c in shift["coils"]
+                                      if c["section_key"] == current_section]
+                        sec_done   = sum(1 for c in sec_coils
+                                         if c["status"] == "ROLLED")
+                        sec_mt     = sum((c.get("actual_weight") or c["weight"])
+                                        for c in sec_coils if c["status"] == "ROLLED")
+                        sec_total  = sum(c["weight"] for c in sec_coils)
+                        st.markdown(
+                            f"#### {current_section.replace('_',' ').title()}"
+                            f" — {sec_done}/{len(sec_coils)} coils"
+                            f" | {sec_mt:.1f}/{sec_total:.1f} MT"
+                        )
+
+                    status = coil["status"]
+                    icon   = {"PENDING":"⏳","ROLLED":"✅",
+                              "SKIPPED":"⏭️","ON_HOLD":"🔴",
+                              "PARTIAL":"⚠️"}.get(status,"❓")
+
+                    # Card container
+                    with st.container():
+                        c1, c2, c3, c4, c5, c6 = st.columns(
+                            [2.5, 1, 1, 1, 1, 3])
+
+                        c1.markdown(
+                            f"{icon} **{coil['coil_number']}**  \n"
+                            f"<small>{coil['customer'][:14]} | "
+                            f"{coil['quality']} | {coil['tdc']}</small>",
+                            unsafe_allow_html=True)
+                        c2.metric("Width", f"{coil['width']:.0f}mm",
+                                  label_visibility="collapsed")
+                        c2.caption(f"W: {coil['width']:.0f}mm")
+                        c3.caption(f"T: {coil['thick']:.2f}→{coil['rt']:.2f}mm")
+                        c4.caption(f"Wt: {coil['weight']:.3f}MT")
+                        c5.caption(f"Age: {coil.get('age','-')}d")
+
+                        with c6:
+                            if status == "PENDING":
+                                # Main action buttons
+                                b1, b2, b3 = st.columns(3)
+                                if b1.button("✅", key=f"roll_{coil['coil_number']}",
+                                             help="Mark as Rolled",
+                                             use_container_width=True):
+                                    shift = confirm_coil(
+                                        shift, coil["coil_number"],
+                                        status="ROLLED",
+                                        confirmed_by=operator_name)
+                                    # Update roll life tracker
+                                    rs = load_roll_state()
+                                    save_roll_state(
+                                        rs,
+                                        plan_date=shift_date.isoformat(),
+                                        **{f"{shift_mill.lower()}_mt_rolled":
+                                           coil["weight"]})
+                                    save_shift(shift)
+                                    st.rerun()
+
+                                if b2.button("⏭️", key=f"skip_{coil['coil_number']}",
+                                             help="Skip this coil",
+                                             use_container_width=True):
+                                    shift = confirm_coil(
+                                        shift, coil["coil_number"],
+                                        status="SKIPPED",
+                                        confirmed_by=operator_name)
+                                    save_shift(shift)
+                                    st.rerun()
+
+                                if b3.button("🔴", key=f"hold_{coil['coil_number']}",
+                                             help="Put on Hold",
+                                             use_container_width=True):
+                                    shift = confirm_coil(
+                                        shift, coil["coil_number"],
+                                        status="ON_HOLD",
+                                        confirmed_by=operator_name)
+                                    save_shift(shift)
+                                    st.rerun()
+
+                            elif status == "ROLLED":
+                                st.caption(
+                                    f"✅ Done  "
+                                    f"{(coil.get('confirmed_at') or '')[:16]}")
+                                if st.button("↩️ Undo",
+                                             key=f"undo_{coil['coil_number']}",
+                                             use_container_width=True):
+                                    shift = confirm_coil(
+                                        shift, coil["coil_number"],
+                                        status="PENDING")
+                                    # Deduct from roll life
+                                    rs = load_roll_state()
+                                    ms = rs.get(shift_mill, {})
+                                    ms["mt_used"] = max(
+                                        0, ms.get("mt_used",0) - coil["weight"])
+                                    save_roll_state(rs)
+                                    save_shift(shift)
+                                    st.rerun()
+
+                            else:
+                                # Hold / Skipped — allow reset to pending
+                                if st.button("↩️ Reset",
+                                             key=f"rst_{coil['coil_number']}",
+                                             use_container_width=True):
+                                    shift = confirm_coil(
+                                        shift, coil["coil_number"],
+                                        status="PENDING")
+                                    save_shift(shift)
+                                    st.rerun()
+
+                        st.divider()
+
+            # ── Complete shift button ──────────────────────────────
+            st.divider()
+            col_end1, col_end2 = st.columns([2, 1])
+            with col_end1:
+                shift_notes = st.text_area(
+                    "Shift-end notes (breakdowns, quality issues, etc.)",
+                    value=shift.get("operator_notes",""), key="snotes",
+                    height=80)
+            with col_end2:
+                if st.button("🏁 Complete Shift", type="primary",
+                              use_container_width=True):
+                    shift["status"]         = "COMPLETED"
+                    shift["operator_notes"] = shift_notes
+                    save_shift(shift)
+                    st.success(
+                        f"Shift completed!  "
+                        f"{shift['coils_rolled']}/{shift['total_coils']} coils  |  "
+                        f"{shift['mt_rolled']:.1f}/{shift['mt_target']:.1f} MT  |  "
+                        f"{pct_done:.1f}% plan adherence")
+
+                if st.button("💾 Save Progress", use_container_width=True):
+                    shift["operator_notes"] = shift_notes
+                    save_shift(shift)
+                    st.toast("Progress saved ✅")
+
+    # ════════════════════════════════════════════════════════
+    # TAB 2 — SHIFT HISTORY
+    # ════════════════════════════════════════════════════════
+    with tab_history:
+        st.subheader("Recent Shifts")
+        recent = list_recent_shifts(days_back=30)
+        if not recent:
+            st.info("No shift records found yet.")
+        else:
+            h_df = pd.DataFrame(recent)
+            h_df["Plan Adherence"] = h_df["adherence_pct"].astype(str) + "%"
+            h_df["Coils"] = h_df["coils_rolled"].astype(str) + "/" + \
+                            h_df["total_coils"].astype(str)
+            h_df["MT"] = h_df["mt_rolled"].round(1).astype(str) + "/" + \
+                         h_df["mt_target"].round(1).astype(str)
+            display_cols = ["plan_date","shift_name","mill","roll_type",
+                            "MT","Coils","Plan Adherence","status","last_updated"]
+            st.dataframe(
+                h_df[[c for c in display_cols if c in h_df.columns]],
+                use_container_width=True, hide_index=True)
+
+            # Drill into a specific shift
+            st.subheader("View Shift Detail")
+            shift_ids = [r["shift_id"] for r in recent]
+            sel = st.selectbox("Select shift", shift_ids, key="sel_shift")
+            if sel:
+                sel_rec = next((r for r in recent if r["shift_id"] == sel), None)
+                if sel_rec:
+                    date_str, mill_str, sno_str = (
+                        sel_rec["plan_date"],
+                        sel_rec["mill"],
+                        int(sel_rec["shift_id"].split("_S")[-1]))
+                    full_shift = load_shift(date_str, mill_str, sno_str)
+                    if full_shift and full_shift.get("coils"):
+                        coil_df = pd.DataFrame([{
+                            "Coil":      c["coil_number"],
+                            "Section":   c["section_key"].replace("_"," ").title(),
+                            "Customer":  c["customer"][:12],
+                            "Width":     c["width"],
+                            "Thick→RT":  f"{c['thick']:.2f}→{c['rt']:.2f}",
+                            "Weight":    c["weight"],
+                            "Status":    COIL_STATUS.get(c["status"], c["status"]),
+                            "Done At":   (c.get("confirmed_at") or "")[:16],
+                        } for c in full_shift["coils"]])
+                        st.dataframe(coil_df, use_container_width=True,
+                                     hide_index=True)
+                        # Download
+                        st.download_button(
+                            "⬇️ Download shift report",
+                            data=coil_df.to_csv(index=False),
+                            file_name=f"shift_{sel}.csv",
+                            mime="text/csv",
+                        )
+
+    # ════════════════════════════════════════════════════════
+    # TAB 3 — ANALYTICS
+    # ════════════════════════════════════════════════════════
+    with tab_analytics:
+        st.subheader("Shift Analytics")
+        recent_full = list_recent_shifts(30)
+        if not recent_full:
+            st.info("No data yet — complete some shifts first.")
+        else:
+            date_from = st.date_input("From date",
+                value=date.today() - __import__("datetime").timedelta(days=7),
+                key="af")
+            date_to   = st.date_input("To date", value=date.today(), key="at")
+            mill_filter = st.multiselect("Mill", ["CRM04","CRM06"],
+                                          default=["CRM04","CRM06"], key="amf")
+
+            filtered_shifts = [
+                r for r in recent_full
+                if date_from.isoformat() <= r["plan_date"] <= date_to.isoformat()
+                and r["mill"] in mill_filter
+            ]
+
+            if not filtered_shifts:
+                st.info("No shifts in selected range.")
+            else:
+                # Load full records for analytics
+                full_recs = []
+                for r in filtered_shifts:
+                    sno = int(r["shift_id"].split("_S")[-1])
+                    fs  = load_shift(r["plan_date"], r["mill"], sno)
+                    if fs:
+                        full_recs.append(fs)
+
+                analytics = get_shift_analytics(full_recs)
+
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("Total MT Rolled",  f"{analytics['total_mt_rolled']:.1f}")
+                a2.metric("Plan Adherence",   f"{analytics['plan_adherence']:.1f}%")
+                a3.metric("Coils Rolled",     analytics["coils_rolled"])
+                a4.metric("Coil Adherence",   f"{analytics['coil_adherence']:.1f}%")
+
+                st.divider()
+
+                col_r, col_s2 = st.columns(2)
+                with col_r:
+                    st.subheader("MT by Roll Type")
+                    if analytics["roll_type_mt"]:
+                        rt_df = pd.DataFrame(
+                            analytics["roll_type_mt"].items(),
+                            columns=["Roll Type","MT Rolled"])
+                        st.bar_chart(rt_df.set_index("Roll Type"))
+
+                with col_s2:
+                    st.subheader("MT by Section")
+                    if analytics["section_mt"]:
+                        sec_df = pd.DataFrame(
+                            analytics["section_mt"].items(),
+                            columns=["Section","MT Rolled"])
+                        sec_df["Section"] = sec_df["Section"].str.replace("_"," ").str.title()
+                        st.bar_chart(sec_df.set_index("Section"))
+
+                # Day-wise trend
+                st.subheader("Day-wise MT Trend")
+                day_mt = {}
+                for r in filtered_shifts:
+                    d = r["plan_date"]
+                    day_mt[d] = day_mt.get(d, 0) + r["mt_rolled"]
+                if day_mt:
+                    trend_df = pd.DataFrame(
+                        sorted(day_mt.items()), columns=["Date","MT Rolled"])
+                    st.line_chart(trend_df.set_index("Date"))
+
+                # Shift-wise adherence table
+                st.subheader("Shift-wise Summary")
+                sum_df = pd.DataFrame([{
+                    "Date":        r["plan_date"],
+                    "Shift":       r["shift_name"],
+                    "Mill":        r["mill"],
+                    "Roll Type":   r["roll_type"],
+                    "MT Rolled":   round(r["mt_rolled"],1),
+                    "MT Target":   round(r["mt_target"],1),
+                    "Adherence %": r["adherence_pct"],
+                    "Coils Done":  f"{r['coils_rolled']}/{r['total_coils']}",
+                } for r in filtered_shifts])
+                st.dataframe(sum_df, use_container_width=True, hide_index=True)
