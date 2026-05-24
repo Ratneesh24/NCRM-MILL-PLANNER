@@ -211,3 +211,153 @@ def get_storage_mode() -> str:
         return "☁️  Supabase (persistent)"
     reason = _last_error or "env vars not set"
     return f"💾  Local only — {reason}"
+
+
+# ── Roll State Persistence ──────────────────────────────────────────────────
+# Stored as a separate key in the same learning_db table
+_ROLL_STATE_KEY   = "roll_state_v1"
+_ROLL_STATE_LOCAL = "/tmp/roll_state.json"
+
+EMPTY_ROLL_STATE = {
+    "CRM04": {
+        "roll_type":      "LIGHT_MATT",
+        "mt_used":        0.0,
+        "mt_life":        300.0,
+        "roll_number":    "",
+        "installed_date": "",
+        "last_updated":   "",
+        "last_plan_date": "",
+        "history":        []
+    },
+    "CRM06": {
+        "roll_type":      "LIGHT_MATT",
+        "mt_used":        0.0,
+        "mt_life":        280.0,
+        "roll_number":    "",
+        "installed_date": "",
+        "last_updated":   "",
+        "last_plan_date": "",
+        "history":        []
+    }
+}
+
+
+def load_roll_state() -> dict:
+    """Load persisted roll state. Returns defaults if nothing saved yet."""
+    client = _get_client()
+    if client:
+        try:
+            resp = (client.table("learning_db")
+                          .select("data")
+                          .eq("key", _ROLL_STATE_KEY)
+                          .execute())
+            if resp.data:
+                saved = resp.data[0]["data"]
+                for mill in ("CRM04", "CRM06"):
+                    if mill not in saved:
+                        saved[mill] = dict(EMPTY_ROLL_STATE[mill])
+                    for k, v in EMPTY_ROLL_STATE[mill].items():
+                        if k not in saved[mill]:
+                            saved[mill][k] = v
+                return saved
+        except Exception as e:
+            global _last_error
+            _last_error = f"Roll state read error: {e}"
+
+    if os.path.exists(_ROLL_STATE_LOCAL):
+        try:
+            with open(_ROLL_STATE_LOCAL) as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "CRM04": dict(EMPTY_ROLL_STATE["CRM04"]),
+        "CRM06": dict(EMPTY_ROLL_STATE["CRM06"]),
+    }
+
+
+def save_roll_state(state: dict, plan_date: str = "",
+                    crm04_mt_rolled: float = 0.0,
+                    crm06_mt_rolled: float = 0.0) -> bool:
+    """
+    Persist roll state after a shift/analysis.
+    Adds today rolled MT to mt_used, appends history entry.
+    """
+    now = datetime.utcnow().isoformat()
+
+    for mill, mt_rolled in [("CRM04", crm04_mt_rolled),
+                              ("CRM06", crm06_mt_rolled)]:
+        if mill not in state:
+            state[mill] = dict(EMPTY_ROLL_STATE[mill])
+        ms           = state[mill]
+        old_mt       = ms.get("mt_used", 0.0)
+        new_mt       = round(old_mt + mt_rolled, 1)
+        ms["mt_used"]        = new_mt
+        ms["last_updated"]   = now
+        ms["last_plan_date"] = plan_date or now[:10]
+        if mt_rolled > 0:
+            if "history" not in ms:
+                ms["history"] = []
+            ms["history"].append({
+                "date":        plan_date or now[:10],
+                "mt_rolled":   round(mt_rolled, 1),
+                "roll_type":   ms.get("roll_type", ""),
+                "mt_used_end": new_mt,
+            })
+            ms["history"] = ms["history"][-90:]
+
+    state["last_updated"] = now
+    success = False
+
+    client = _get_client()
+    if client:
+        try:
+            client.table("learning_db").upsert({
+                "key":        _ROLL_STATE_KEY,
+                "data":       state,
+                "updated_at": now,
+            }).execute()
+            success = True
+        except Exception as e:
+            global _last_error
+            _last_error = f"Roll state save error: {e}"
+
+    try:
+        tmp = _ROLL_STATE_LOCAL + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+        os.replace(tmp, _ROLL_STATE_LOCAL)
+        if not success:
+            success = True
+    except Exception:
+        pass
+
+    return success
+
+
+def record_roll_change(mill: str, new_roll_type: str,
+                       new_mt_life: float, roll_number: str = "",
+                       installed_date: str = "") -> bool:
+    """Reset mt_used to 0 when a roll is physically changed on the mill."""
+    state = load_roll_state()
+    now   = datetime.utcnow().isoformat()
+    if mill not in state:
+        state[mill] = dict(EMPTY_ROLL_STATE[mill])
+    ms = state[mill]
+    if "history" not in ms:
+        ms["history"] = []
+    ms["history"].append({
+        "date":              now[:10],
+        "event":             "ROLL_CHANGE",
+        "old_roll":          ms.get("roll_type", ""),
+        "new_roll":          new_roll_type,
+        "mt_used_at_change": ms.get("mt_used", 0.0),
+    })
+    ms["roll_type"]      = new_roll_type
+    ms["mt_used"]        = 0.0
+    ms["mt_life"]        = new_mt_life
+    ms["roll_number"]    = roll_number
+    ms["installed_date"] = installed_date or now[:10]
+    ms["last_updated"]   = now
+    return save_roll_state(state)
