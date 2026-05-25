@@ -127,43 +127,53 @@ def filter_rolling_coils(df, learning_db=None):
     # Drop excluded next stages
     df = df[~df['Next Stage'].isin(EXCLUDED_NEXT)]
 
-    # HC80 coils: exclude if Actual Thick < Plan Rolling Thick 1
-    # (target not yet reached — planner defers these to next campaign)
-    # Include if Actual Thick == Plan Rolling Thick 1 (at target, ready for anneal)
-    hc80_below_target = ((df['Cust TDC'] == 'HC80') &
-                         (df['Actual Thick'].fillna(0) <
-                          df['Plan Rolling Thick 1'].fillna(0) - 0.05))
-    df = df[~hc80_below_target]
+    # ── HC80 (TSBH80) — include only when Actual Thick >= Plan RT ──────────
+    # HC80 coils below target (Actual Thick < Plan RT) are mid-campaign and
+    # deferred by planner. Those at/above target are ready for next pass.
+    hc80_below = ((df['Cust TDC'] == 'HC80') &
+                  (df['Actual Thick'].fillna(0) <
+                   df['Plan Rolling Thick 1'].fillna(0) - 0.05))
+    df = df[~hc80_below]
 
-    # HC80 in transit storage (RNM6 etc.) also exclude
-    hc80_rnm = ((df['Cust TDC'] == 'HC80') &
-                (df['Storage Location'].isin(['RNM6','RNM4','RNM5'])))
-    df = df[~hc80_rnm]
+    # ── TATFHC / TR17 (Tube FH) — storage-based inclusion ───────────────────
+    # RC01 = new arrivals. Exclude UNLESS they have an FH remark (in campaign)
+    # RC01 + no FH remark = genuinely new, not yet assigned → exclude
+    # RC01 + "FH" in remark = planner has mentally assigned them → include
+    tatfhc_rc01_no_fh = (
+        (df['Actual Quality'] == 'TATFHC') &
+        (df['Storage Location'] == 'RC01') &
+        (~df['Planning Remark'].fillna('').astype(str).str.upper().str.contains('FH', na=False))
+    )
+    df = df[~tatfhc_rc01_no_fh]
 
-    # TATFHC/RC01 = new arrivals not yet in campaign
-    # Exception: if PP-PENDING, it IS in the campaign (SAP lag) — include it
-    tatfhc_rc01_new = ((df['Actual Quality'] == 'TATFHC') &
-                       (df['Storage Location'] == 'RC01') &
-                       (~df['Next Stage'].str.upper().str.contains('PP-PENDING', na=False)))
-    df = df[~tatfhc_rc01_new]
+    # ── PP-PENDING — exclude unless TATFHC (campaign coils, SAP lag) ─────────
+    pp_mask   = df['Next Stage'].str.upper().str.contains('PP-PENDING', na=False)
+    is_tatfhc = df['Actual Quality'] == 'TATFHC'
+    df = df[~pp_mask | is_tatfhc]
 
-    # PP-PENDING FOR PLAN: exclude UNLESS it is a TATFHC/TR17 Tube FH coil
-    # — planners always include Tube FH coils regardless of PP-PENDING status
-    # because they are physically ready and roll campaign must be continuous.
-    pp_mask    = df['Next Stage'].str.upper().str.contains('PP-PENDING', na=False)
-    tube_fh    = (df['Actual Quality'] == 'TATFHC') & (df['Product Code'] == 'C09')
-    df = df[~pp_mask | tube_fh]
+    # ── HC80 old coils (Age >= 20 days) — exclude ───────────────────────────
+    # HC80 coils that are 20+ days old and still not at target = stuck in WIP
+    # Planner consistently skips these; fresh HC80 (Age <= 8) are included
+    hc80_old = ((df['Cust TDC'] == 'HC80') &
+                (df['Coil Age(# Days)'].fillna(0) >= 20) &
+                (df['Actual Thick'].fillna(0) <
+                 df['Plan Rolling Thick 1'].fillna(0) - 0.05))
+    df = df[~hc80_old]
 
-    # Drop very-low-weight stubs
+    # ── TATXXD/AH12 going to S-SPM — exclude ────────────────────────────────
+    # Already rolled to target thickness, waiting for Skin Pass mill
+    tatxxd_spm = ((df['Actual Quality'] == 'TATXXD') &
+                  (df['Next Stage'].str.contains('S-SPM', na=False)))
+    df = df[~tatxxd_spm]
+
+    # ── Drop very-low-weight stubs ───────────────────────────────────────────
     df = df[df['Input Coil Weight'].fillna(0) >= 0.5]
 
-    # Drop coils with no rolling target
-    # Exception: TATFHC/TR17 Tube FH with RT=0 but Next=R-C R SLITTER
-    # — planner assigns RT manually on the floor, include these
-    tube_fh_no_rt = ((df['Actual Quality'] == 'TATFHC') &
-                     (df['Product Code'] == 'C09') &
-                     (df['Next Stage'] == 'R-C R SLITTER'))
-    df = df[(df['Plan Rolling Thick 1'].fillna(0) > 0) | tube_fh_no_rt]
+    # ── Drop coils with no rolling target ───────────────────────────────────
+    # Exception: TATFHC (Tube FH) — planner assigns RT manually on floor
+    # Include all TATFHC regardless of RT=0
+    is_tatfhc = df['Actual Quality'] == 'TATFHC'
+    df = df[(df['Plan Rolling Thick 1'].fillna(0) > 0) | is_tatfhc]
 
     # Drop HOLD coils
     remark = df['Planning Remark'].fillna('').astype(str).str.lower()
