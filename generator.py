@@ -127,18 +127,52 @@ def filter_rolling_coils(df, learning_db=None):
     # Drop excluded next stages
     df = df[~df['Next Stage'].isin(EXCLUDED_NEXT)]
 
-    # Exclude PP-PENDING FOR PLAN — not yet formally released for rolling
-    df = df[~df['Next Stage'].str.upper().str.contains('PP-PENDING', na=False)]
+    # HC80 coils: exclude if Actual Thick < Plan Rolling Thick 1
+    # (target not yet reached — planner defers these to next campaign)
+    # Include if Actual Thick == Plan Rolling Thick 1 (at target, ready for anneal)
+    hc80_below_target = ((df['Cust TDC'] == 'HC80') &
+                         (df['Actual Thick'].fillna(0) <
+                          df['Plan Rolling Thick 1'].fillna(0) - 0.05))
+    df = df[~hc80_below_target]
+
+    # HC80 in transit storage (RNM6 etc.) also exclude
+    hc80_rnm = ((df['Cust TDC'] == 'HC80') &
+                (df['Storage Location'].isin(['RNM6','RNM4','RNM5'])))
+    df = df[~hc80_rnm]
+
+    # TATFHC/RC01 = new arrivals not yet in campaign
+    # Exception: if PP-PENDING, it IS in the campaign (SAP lag) — include it
+    tatfhc_rc01_new = ((df['Actual Quality'] == 'TATFHC') &
+                       (df['Storage Location'] == 'RC01') &
+                       (~df['Next Stage'].str.upper().str.contains('PP-PENDING', na=False)))
+    df = df[~tatfhc_rc01_new]
+
+    # PP-PENDING FOR PLAN: exclude UNLESS it is a TATFHC/TR17 Tube FH coil
+    # — planners always include Tube FH coils regardless of PP-PENDING status
+    # because they are physically ready and roll campaign must be continuous.
+    pp_mask    = df['Next Stage'].str.upper().str.contains('PP-PENDING', na=False)
+    tube_fh    = (df['Actual Quality'] == 'TATFHC') & (df['Product Code'] == 'C09')
+    df = df[~pp_mask | tube_fh]
 
     # Drop very-low-weight stubs
     df = df[df['Input Coil Weight'].fillna(0) >= 0.5]
 
     # Drop coils with no rolling target
-    df = df[df['Plan Rolling Thick 1'].fillna(0) > 0]
+    # Exception: TATFHC/TR17 Tube FH with RT=0 but Next=R-C R SLITTER
+    # — planner assigns RT manually on the floor, include these
+    tube_fh_no_rt = ((df['Actual Quality'] == 'TATFHC') &
+                     (df['Product Code'] == 'C09') &
+                     (df['Next Stage'] == 'R-C R SLITTER'))
+    df = df[(df['Plan Rolling Thick 1'].fillna(0) > 0) | tube_fh_no_rt]
 
     # Drop HOLD coils
     remark = df['Planning Remark'].fillna('').astype(str).str.lower()
-    df = df[~remark.str.contains('hold', na=False)]
+    # Only exclude if 'hold' appears as a standalone word (not embedded in route string)
+    # e.g. 'on hold' or 'hold' alone — NOT '>>hold' which is a route thickness step
+    import re as _re
+    hold_standalone = remark.apply(
+        lambda r: bool(_re.search(r'(?<![>0-9])hold(?![>0-9])', r)))
+    df = df[~hold_standalone]
     df = df[df['Next Stage'].astype(str).str.upper() != 'HOLD']
 
     return df.reset_index(drop=True)
