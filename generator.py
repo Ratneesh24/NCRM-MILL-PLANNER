@@ -127,6 +127,9 @@ def filter_rolling_coils(df, learning_db=None):
     # Drop excluded next stages
     df = df[~df['Next Stage'].isin(EXCLUDED_NEXT)]
 
+    # Exclude PP-PENDING FOR PLAN — not yet formally released for rolling
+    df = df[~df['Next Stage'].str.upper().str.contains('PP-PENDING', na=False)]
+
     # Drop very-low-weight stubs
     df = df[df['Input Coil Weight'].fillna(0) >= 0.5]
 
@@ -405,24 +408,21 @@ def _write_subtotal(ws, row_idx, start, end):
 
 def _write_priority_block(ws, start_row, sections):
     """
-    After grand total, print the shift priority block:
-        PLANNING
-        1-- ...     CRM-04
-        2-- ...
-        1-- ...     CRM-06
+    Write the PLANNING priority block after the grand total.
     """
     crm04_sections = sorted(
-        {s['section_key'] for s in sections if s['mill'] in {'CRM04', 'CRM04/06'}},
+        {s['section_key'] for s in sections if s['mill'] == 'CRM04'},
         key=lambda k: CRM04_PRIORITY.index(k) if k in CRM04_PRIORITY else 99,
     )
     crm06_sections = sorted(
-        {s['section_key'] for s in sections if s['mill'] in {'CRM06', 'CRM04/06'}},
+        {s['section_key'] for s in sections if s['mill'] == 'CRM06'},
         key=lambda k: CRM06_PRIORITY.index(k) if k in CRM06_PRIORITY else 99,
     )
 
     r = start_row + 1
+
     c = ws.cell(row=r, column=1, value='PLANNING')
-    c.font = Font(name='Calibri', size=10, bold=True)
+    c.font      = Font(name='Calibri', size=10, bold=True)
     c.alignment = Alignment(horizontal='left')
     r += 1
 
@@ -435,7 +435,7 @@ def _write_priority_block(ws, start_row, sections):
             tag.font = Font(name='Calibri', size=10, bold=True)
         r += 1
 
-    r += 1  # blank line
+    r += 1
     for idx, sec in enumerate(crm06_sections, start=1):
         name = SECTION_SHORT_NAME.get(sec, sec)
         ws.cell(row=r, column=1, value=f"{idx}-- {name}").font = \
