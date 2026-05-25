@@ -181,6 +181,13 @@ def assign_section_base(row):
         if 'M-ROLLING' in next_stage:
             return 'CRCA_FINISH_CRM06', 'CRM06'
 
+    # ── 7b. TSBH62/C162/C462 with 'final' = H&T FINISH (last pass confirmed) ──
+    # Only applies to TSBH62 grades — for BSW2/TSBH80 'final' is route notation
+    if (prod_code == 'B28' and quality == 'TSBH62'
+            and tdc in {'C162', 'C462', 'C176'}
+            and 'FINAL' in remark):
+        return 'HT_FINISH', 'CRM04'
+
     # ── 8. H&T grades (TSBH62 / TSBH80 / TSB75S / TSB80C) ────────────
     HT_QUALITIES = {'TSBH62', 'TSBH80', 'TSB75S', 'TSB80C'}
     HT_TDCS      = {'C162', 'C462', 'C176', 'C180', 'C280',
