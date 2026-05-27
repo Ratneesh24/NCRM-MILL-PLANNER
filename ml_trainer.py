@@ -150,10 +150,21 @@ def train_from_pair(wip_path: str, actual_path: str,
     # Train
     result = clf.train(verbose=verbose)
 
-    # Save
+    # Save locally
     clf.save(model_path)
     if verbose:
-        print(f"── Model saved: {model_path}")
+        print(f"── Model saved locally: {model_path}")
+
+    # Save to Supabase (survives Streamlit restarts)
+    try:
+        from db import save_model_to_supabase
+        ok = save_model_to_supabase(model_path)
+        if verbose:
+            status = "☁️ saved to Supabase" if ok else "⚠️ Supabase save skipped"
+            print(f"── Model {status}")
+    except Exception as e:
+        if verbose:
+            print(f"── Supabase model save error: {e}")
 
     return clf
 
