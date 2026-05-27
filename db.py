@@ -459,3 +459,111 @@ def get_db_stats() -> dict:
         }
     except Exception as e:
         return {"error": str(e), "prod": 0, "test": 0, "total": 0}
+
+
+# ── ML Model Persistence ────────────────────────────────────────────────────
+# Model stored compressed+base64 in Supabase under a dedicated key
+
+_MODEL_KEY       = "ml_model_v2"
+_MODEL_KEY_TEST  = "TEST_ml_model_v2"
+_LOCAL_MODEL_PATH = "/tmp/models/section_clf.pkl"
+
+import zlib, base64 as _b64
+
+def _model_key() -> str:
+    return _MODEL_KEY_TEST if _TEST_MODE else _MODEL_KEY
+
+
+def save_model_to_supabase(model_path: str) -> bool:
+    """
+    Compress the .pkl file and store it in Supabase.
+    Falls back silently if Supabase is not connected.
+    """
+    if not os.path.exists(model_path):
+        return False
+
+    try:
+        with open(model_path, 'rb') as f:
+            raw = f.read()
+        compressed = zlib.compress(raw, level=9)
+        encoded    = _b64.b64encode(compressed).decode('ascii')
+
+        payload = {
+            'model_b64':    encoded,
+            'size_original': len(raw),
+            'size_compressed': len(compressed),
+            'saved_at':     datetime.utcnow().isoformat(),
+        }
+
+        client = _get_client()
+        if client:
+            client.table("learning_db").upsert({
+                "key":        _model_key(),
+                "data":       payload,
+                "updated_at": payload['saved_at'],
+            }).execute()
+            return True
+    except Exception as e:
+        print(f"[Supabase] model save error: {e}")
+
+    return False
+
+
+def load_model_from_supabase(model_path: str) -> bool:
+    """
+    Download model from Supabase, decompress, save to model_path.
+    Returns True if successful.
+    """
+    client = _get_client()
+    if not client:
+        return False
+
+    try:
+        resp = (client.table("learning_db")
+                      .select("data")
+                      .eq("key", _model_key())
+                      .execute())
+        if not resp.data:
+            return False
+
+        payload    = resp.data[0]["data"]
+        encoded    = payload.get("model_b64", "")
+        if not encoded:
+            return False
+
+        compressed = _b64.b64decode(encoded.encode('ascii'))
+        raw        = zlib.decompress(compressed)
+
+        os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
+        tmp = model_path + ".tmp"
+        with open(tmp, 'wb') as f:
+            f.write(raw)
+        os.replace(tmp, model_path)
+        return True
+
+    except Exception as e:
+        print(f"[Supabase] model load error: {e}")
+        return False
+
+
+def get_model_info() -> dict:
+    """Return metadata about the stored model (size, date) without downloading it."""
+    client = _get_client()
+    if not client:
+        return {}
+    try:
+        resp = (client.table("learning_db")
+                      .select("data,updated_at")
+                      .eq("key", _model_key())
+                      .execute())
+        if resp.data:
+            d = resp.data[0]["data"]
+            return {
+                "saved_at":       d.get("saved_at", ""),
+                "size_original":  d.get("size_original", 0),
+                "size_compressed":d.get("size_compressed", 0),
+                "exists":         True,
+            }
+    except Exception:
+        pass
+    return {"exists": False}
