@@ -1,3 +1,4 @@
+import os
 """
 Section assignment — the core routing decision tree.
 
@@ -346,5 +347,73 @@ def assign_section_with_learning(row, learning_db=None):
                 return rule['section'], rule['mill'], 'LEARNED_SOFT'
 
     # 3. Fall back to base tree
+    section, mill = assign_section_base(row)
+    return section, mill, 'BASE_RULE'
+
+
+# ── ML-enhanced assignment ───────────────────────────────────────────────────
+
+_clf_cache = None
+_clf_path  = os.path.join(os.path.dirname(__file__), 'models', 'section_clf.pkl')
+
+def _get_classifier():
+    global _clf_cache
+    if _clf_cache is not None:
+        return _clf_cache
+    try:
+        from ml_classifier import SectionClassifier, ML_CONFIDENCE_THRESHOLD
+        clf = SectionClassifier()
+        if clf.load(_clf_path):
+            _clf_cache = clf
+            return clf
+    except Exception:
+        pass
+    return None
+
+
+def assign_section_ml(row, learning_db=None) -> tuple:
+    """
+    Hybrid routing:
+      1. Check coil-level overrides (learning DB)
+      2. Run ML classifier — if confidence >= threshold, use it
+      3. Fallback to rule engine
+      4. Apply learned grade routing from learning DB
+
+    Returns (section_key, mill_code, source_tag)
+    """
+    import os
+
+    coil_num = _s(row.get('Coil Number'))
+
+    # ── 1. Coil-level override always wins ───────────────────────
+    if learning_db:
+        ov = learning_db.get('coil_overrides', {}).get(coil_num)
+        if ov:
+            return ov['section'], ov['mill'], 'COIL_OVERRIDE'
+
+    # ── 2. ML classifier ─────────────────────────────────────────
+    clf = _get_classifier()
+    if clf and clf.ready:
+        try:
+            from ml_classifier import ML_CONFIDENCE_THRESHOLD
+            import pandas as pd
+            sec_ml, mill_ml, conf = clf.predict_one(pd.Series(dict(row)))
+            if conf >= ML_CONFIDENCE_THRESHOLD and sec_ml != 'OTHER':
+                return sec_ml, mill_ml, f'ML:{conf:.2f}'
+        except Exception:
+            pass
+
+    # ── 3. Learned grade routing (confidence >= 3) ────────────────
+    if learning_db:
+        quality    = _s(row.get('Actual Quality'))
+        tdc        = _s(row.get('Cust TDC'))
+        prod_code  = _s(row.get('Product Code'))
+        next_stage = _s(row.get('Next Stage'))
+        key = f"{quality}|{tdc}|{prod_code}|{next_stage}"
+        rule = learning_db.get('grade_routing', {}).get(key)
+        if rule and rule.get('confidence', 0) >= 3:
+            return rule['section'], rule['mill'], 'LEARNED_HARD'
+
+    # ── 4. Base rule engine ───────────────────────────────────────
     section, mill = assign_section_base(row)
     return section, mill, 'BASE_RULE'
