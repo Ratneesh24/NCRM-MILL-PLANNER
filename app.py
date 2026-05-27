@@ -420,6 +420,47 @@ elif page == "📊 Stats & Rules":
 
     st.divider()
 
+    # ── ML Model Status ──────────────────────────────────────────────────
+    st.subheader("🤖 ML Model Status")
+    from db import get_model_info, load_model_from_supabase, save_model_to_supabase
+    import os as _os
+
+    model_path = _os.path.join(_os.path.dirname(__file__), 'models', 'section_clf.pkl')
+    local_exists = _os.path.exists(model_path)
+    cloud_info   = get_model_info()
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("Local model",  "✅ Loaded" if local_exists else "❌ Missing")
+    mc2.metric("Cloud model",  "☁️ Available" if cloud_info.get('exists') else "❌ Not uploaded")
+    if cloud_info.get('saved_at'):
+        mc3.metric("Last trained", cloud_info['saved_at'][:10])
+    if cloud_info.get('size_original'):
+        st.caption(
+            f"Model size: {cloud_info['size_original']/1024/1024:.1f} MB original → "
+            f"{cloud_info['size_compressed']/1024/1024:.1f} MB compressed in Supabase")
+
+    col_ml1, col_ml2 = st.columns(2)
+    with col_ml1:
+        if cloud_info.get('exists') and not local_exists:
+            if st.button("⬇️ Download model from Supabase", use_container_width=True):
+                with st.spinner("Downloading…"):
+                    ok = load_model_from_supabase(model_path)
+                    if ok:
+                        import sectioning as _sec; _sec._clf_cache = None
+                        st.success("Model downloaded and ready.")
+                        st.rerun()
+                    else:
+                        st.error("Download failed.")
+    with col_ml2:
+        if local_exists:
+            if st.button("☁️ Upload local model to Supabase", use_container_width=True):
+                with st.spinner("Uploading…"):
+                    ok = save_model_to_supabase(model_path)
+                    st.success("Uploaded." if ok else "Upload failed.")
+                    st.rerun()
+
+    st.divider()
+
     # ── DB Management ─────────────────────────────────────────────────
     st.subheader("🗄️ Database Management")
     from db import get_db_stats, clear_test_data, is_test_mode
