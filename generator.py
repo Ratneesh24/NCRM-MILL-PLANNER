@@ -19,7 +19,7 @@ from constants import (
     SECTION_COLOURS, SECTION_SHORT_NAME, CRM04_PRIORITY, CRM06_PRIORITY,
     build_section_label, abbreviate_customer,
 )
-from sectioning import assign_section_with_learning, _f, _s
+from sectioning import assign_section_with_learning, assign_section_ml, _f, _s
 
 
 EXCEL_EPOCH = date(1899, 12, 30)
@@ -195,7 +195,7 @@ def assign_all(df, learning_db=None):
     """Return df with new columns: _section, _mill, _source."""
     sections, mills, sources = [], [], []
     for _, row in df.iterrows():
-        s, m, src = assign_section_with_learning(row, learning_db)
+        s, m, src = assign_section_ml(row, learning_db)
         sections.append(s)
         mills.append(m)
         sources.append(src)
