@@ -1,0 +1,3 @@
+# Tell GitHub to treat these as binary files
+*.pkl binary
+*.pkl linguist-detectable=false
