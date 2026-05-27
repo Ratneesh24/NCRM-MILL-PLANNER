@@ -178,28 +178,44 @@ if page == "📋 Generate Plan":
 elif page == "🧠 Learn from Corrections":
     st.title("🧠 Learn from Planner Corrections")
     st.caption(
-        "Upload the generated plan and the planner's corrected version. "
-        "Every correction is extracted and stored as a routing rule."
+        "Upload the WIP file + generated plan + planner's corrected version. "
+        "Routing rules AND the ML model update automatically in one step."
     )
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        gen_file = st.file_uploader("Generated plan (system output)", type=["xlsx"], key="gen")
+        wip_learn = st.file_uploader(
+            "WIP file (same one used to generate)", type=["xlsx"], key="wip_learn")
     with col2:
-        act_file = st.file_uploader("Corrected plan (planner version)", type=["xlsx"], key="act")
+        gen_file = st.file_uploader(
+            "Generated plan (system output)", type=["xlsx"], key="gen")
+    with col3:
+        act_file = st.file_uploader(
+            "Corrected plan (planner version)", type=["xlsx"], key="act")
 
     learn_date = st.date_input("Plan date", value=date.today())
 
-    if gen_file and act_file and st.button("🧠 Run Learning Session",
-                                            type="primary", use_container_width=True):
-        with st.spinner("Comparing plans and updating rules…"):
+    all_uploaded = wip_learn and gen_file and act_file
+    if not all_uploaded:
+        missing = []
+        if not wip_learn: missing.append("WIP file")
+        if not gen_file:  missing.append("Generated plan")
+        if not act_file:  missing.append("Corrected plan")
+        st.info(f"👆 Still needed: {', '.join(missing)}")
+
+    if all_uploaded and st.button("🧠 Run Learning Session",
+                                   type="primary", use_container_width=True):
+        with st.spinner("Comparing plans, updating rules and retraining ML model…"):
             try:
+                # Save uploaded files to temp paths
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tw:
+                    tw.write(wip_learn.read()); wip_path = tw.name
                 with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tg:
                     tg.write(gen_file.read()); gen_path = tg.name
                 with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as ta:
                     ta.write(act_file.read()); act_path = ta.name
 
-                # ── Run the diff + pattern extraction ─────────────────
+                # ── Step 1: Rule-based diff + DB update ───────────────
                 from learner import diff_plans, extract_and_update, \
                                     calculate_accuracy, build_session_entry
 
@@ -222,26 +238,68 @@ elif page == "🧠 Learn from Corrections":
                 cum_acc = (prev * (n_sess - 1) + acc["overall_accuracy"]) / n_sess
                 current_db["cumulative_accuracy"] = round(cum_acc, 4)
                 current_db["total_sessions"]      = n_sess
+                save_db(current_db)
 
-                # ── Save to Supabase (+ local backup) ─────────────────
-                saved = save_db(current_db)
+                # ── Step 2: ML model retrain ───────────────────────────
+                ml_status = ""
+                ml_accuracy = None
+                try:
+                    from ml_trainer    import train_from_pair
+                    from ml_classifier import SectionClassifier
 
+                    model_path = os.path.join(
+                        os.path.dirname(__file__), "models", "section_clf.pkl")
+                    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
+                    clf = train_from_pair(
+                        wip_path    = wip_path,
+                        actual_path = act_path,
+                        model_path  = model_path,
+                        verbose     = False,
+                    )
+
+                    if clf.training_log:
+                        last = clf.training_log[-1]
+                        ml_accuracy = last.get("cv_accuracy")
+                        n_actual    = last.get("n_actual", 0)
+                        n_total     = last.get("n_total", 0)
+                        ml_status = (
+                            f"✅ ML model retrained — "
+                            f"{n_actual} actual + {n_total - n_actual} synthetic samples"
+                            + (f", CV accuracy: **{ml_accuracy*100:.1f}%**"
+                               if ml_accuracy else "")
+                        )
+
+                        # Invalidate cached classifier so next generation uses new model
+                        import sectioning as _sec
+                        _sec._clf_cache = None
+
+                except Exception as ml_err:
+                    ml_status = f"⚠️ ML retrain skipped: {ml_err}"
+
+                # ── Display results ────────────────────────────────────
                 st.success(
-                    f"Learning complete! Accuracy: **{acc['overall_accuracy']*100:.1f}%**  "
+                    f"Learning complete! Rule accuracy: **{acc['overall_accuracy']*100:.1f}%**  "
                     + ("☁️ Saved to Supabase" if is_supabase_connected()
                        else "💾 Saved locally")
                 )
+                if ml_status:
+                    st.info(ml_status)
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Section accuracy",   f"{acc['section_accuracy']*100:.1f}%")
                 c2.metric("Ordering accuracy",  f"{acc['ordering_accuracy']*100:.1f}%")
                 c3.metric("Inclusion accuracy", f"{acc['inclusion_accuracy']*100:.1f}%")
-                c4.metric("Overall",            f"{acc['overall_accuracy']*100:.1f}%")
+                c4.metric("Overall accuracy",   f"{acc['overall_accuracy']*100:.1f}%")
+
+                if ml_accuracy:
+                    st.metric("ML CV accuracy", f"{ml_accuracy*100:.1f}%",
+                              help="Cross-validated accuracy of the XGBoost model on actual labels")
 
                 import pandas as pd
                 ct = session["corrections_by_type"]
                 ct_df = pd.DataFrame([
-                    {"Correction type": k.replace("_", " ").title(), "Count": v}
+                    {"Correction type": k.replace("_"," ").title(), "Count": v}
                     for k, v in ct.items() if v > 0
                 ])
                 if not ct_df.empty:
@@ -249,18 +307,17 @@ elif page == "🧠 Learn from Corrections":
                     st.dataframe(ct_df, use_container_width=True, hide_index=True)
 
                 r1, r2, r3 = st.columns(3)
-                r1.metric("New rules",        added)
-                r2.metric("Reinforced",       reinforced)
-                r3.metric("Conflicts",        conflicts)
+                r1.metric("New rules",   added)
+                r2.metric("Reinforced",  reinforced)
+                r3.metric("Conflicts",   conflicts)
 
-                os.unlink(gen_path); os.unlink(act_path)
+                os.unlink(wip_path)
+                os.unlink(gen_path)
+                os.unlink(act_path)
 
             except Exception as e:
                 st.error(f"Learning error: {e}")
                 import traceback; st.code(traceback.format_exc())
-
-    elif not (gen_file and act_file):
-        st.info("👆 Upload both files to start a learning session.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
