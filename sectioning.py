@@ -361,11 +361,26 @@ def _get_classifier():
     if _clf_cache is not None:
         return _clf_cache
     try:
-        from ml_classifier import SectionClassifier, ML_CONFIDENCE_THRESHOLD
+        from ml_classifier import SectionClassifier
+
+        # 1. Try local file first (fastest)
         clf = SectionClassifier()
         if clf.load(_clf_path):
             _clf_cache = clf
             return clf
+
+        # 2. Try Supabase (model saved there after each training)
+        try:
+            from db import load_model_from_supabase
+            os.makedirs(os.path.dirname(_clf_path), exist_ok=True)
+            if load_model_from_supabase(_clf_path):
+                clf2 = SectionClassifier()
+                if clf2.load(_clf_path):
+                    _clf_cache = clf2
+                    return clf2
+        except Exception:
+            pass
+
     except Exception:
         pass
     return None
