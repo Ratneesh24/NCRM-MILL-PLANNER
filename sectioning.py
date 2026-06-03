@@ -172,14 +172,20 @@ def assign_section_base(row):
             return 'CRCA_FINISH', 'CRM04'
 
     # ── 7. LG BALA / TSBM41 routing ───────────────────────────────────
+    # Storage R034 = finishing area (skin pass or CRCA finish)
+    # Storage R037 = still in rolling queue (goes with other rolling coils)
     if quality == 'TSBM41' and tdc == 'LG01':
+        if storage == 'R034':
+            # In finishing area — CRCA FINISH CRM-06 regardless of next stage
+            return 'CRCA_FINISH_CRM06', 'CRM06'
+        if storage == 'R037':
+            # Still in rolling queue — FIRST ROLLING
+            return 'FIRST_ROLLING', 'CRM06'
+        # Fallback: use next stage
         if 'B-ANNEALING' in next_stage:
             return 'FIRST_ROLLING', 'CRM06'
         if ('R-C R SLITTER' in next_stage or '09-QA' in next_stage
-                or 'RW-REWINDING' in next_stage):
-            return 'CRCA_FINISH_CRM06', 'CRM06'
-        # Still at rolling mill (e.g. next = M-ROLLING MILL) → CRCA finish
-        if 'M-ROLLING' in next_stage:
+                or 'RW-REWINDING' in next_stage or 'M-ROLLING' in next_stage):
             return 'CRCA_FINISH_CRM06', 'CRM06'
 
     # ── 7b. TSBH62/C162/C462 with 'final' = H&T FINISH (last pass confirmed) ──
@@ -233,6 +239,23 @@ def assign_section_base(row):
     if (prod_code == 'B28' and 'B-ANNEALING' in next_stage
             and storage == 'R116'):
         return 'FIRST_ROLLING', 'CRM06'
+
+    # ── 11a. BSW2/BSW1/BSW4 — route by position in rolling sequence ─────────
+    # Planner rule: if Actual Thick == first thickness in Planning Remark
+    # → FIRST ROLLING (very first pass, going to annealing)
+    # Final pass (remark contains 'final' and Actual Thick ≈ RT) → HT_FINISH
+    # All other passes → RE-ROLLING
+    if tdc in {'BSW2', 'BSW1', 'BSW4'}:
+        import re as _re
+        remark_nums = [float(x) for x in _re.findall(r'\d+\.\d+', remark)
+                       if 0.3 <= float(x) <= 6.0]
+        first_thick = remark_nums[0] if remark_nums else None
+        if first_thick and abs(thick - first_thick) <= 0.05:
+            return 'FIRST_ROLLING', 'CRM06'
+        elif 'FINAL' in remark and abs(thick - rt) <= 0.15 and rt > 0:
+            return 'HT_FINISH', 'CRM04'
+        else:
+            return 'RE_ROLLING', 'CRM06'
 
     # ── 11. RE-ROLLING CRM06 ──────────────────────────────────────────
     if tdc == 'JL12' or quality == 'TSBF75':
