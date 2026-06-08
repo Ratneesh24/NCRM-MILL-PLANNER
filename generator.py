@@ -66,7 +66,7 @@ def load_wip(filepath):
       does not match expectations, instead of a cryptic KeyError later.
     """
     sheet_name = _detect_sheet(filepath)
-    df = pd.read_excel(filepath, sheet_name=sheet_name)
+    df = pd.read_excel(filepath, sheet_name=sheet_name, engine='openpyxl')
 
     # Strip whitespace from column headers (common when exported from SAP)
     df.columns = df.columns.str.strip()
@@ -192,18 +192,49 @@ def filter_rolling_coils(df, learning_db=None):
 # Assign + group + sort
 # ---------------------------------------------------------------------------
 def assign_all(df, learning_db=None):
-    """Return df with new columns: _section, _mill, _source."""
-    sections, mills, sources = [], [], []
-    for _, row in df.iterrows():
+    """
+    Return df with _section, _mill, _source columns.
+    Batch ML prediction first (fast), per-row fallback for low-confidence coils.
+    """
+    from sectioning import assign_section_ml, _get_classifier
+    from ml_classifier import ML_CONFIDENCE_THRESHOLD
+
+    df   = df.copy()
+    n    = len(df)
+    sections = [None] * n
+    mills    = [None] * n
+    sources  = [None] * n
+
+    # ── Batch ML (single forward pass for all coils) ──────────────────
+    clf = _get_classifier()
+    if clf and clf.ready:
+        try:
+            preds    = clf.predict_batch(df)
+            pred_map = {r['coil_number']: r for _, r in preds.iterrows()}
+            for i, (_, row) in enumerate(df.iterrows()):
+                coil = str(row.get('Coil Number', ''))
+                p    = pred_map.get(coil)
+                if p is not None and float(p['confidence']) >= ML_CONFIDENCE_THRESHOLD:
+                    sections[i] = p['section']
+                    mills[i]    = p['mill']
+                    sources[i]  = f"ML:{p['confidence']:.2f}"
+        except Exception:
+            pass
+
+    # ── Per-row fallback for unresolved / low-confidence coils ────────
+    for i, (_, row) in enumerate(df.iterrows()):
+        if sections[i] is not None:
+            continue
         s, m, src = assign_section_ml(row, learning_db)
-        sections.append(s)
-        mills.append(m)
-        sources.append(src)
-    df = df.copy()
+        sections[i] = s
+        mills[i]    = m
+        sources[i]  = src
+
     df['_section'] = sections
     df['_mill']    = mills
     df['_source']  = sources
     return df
+
 
 
 def split_combined_mill(group_df, section_key):
