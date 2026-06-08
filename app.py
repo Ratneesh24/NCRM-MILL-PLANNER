@@ -45,7 +45,7 @@ with st.sidebar:
         ["📋 Generate Plan", "🧠 Learn from Corrections",
          "📊 Stats & Rules", "⚙️ Roll Optimiser",
          "🔩 Roll Life Tracker", "📐 Width Programme",
-         "🏭 Shift Execution"],
+         "🏭 Shift Execution", "🎯 Priority Advisor"],
         label_visibility="collapsed",
     )
 
@@ -1608,3 +1608,215 @@ elif page == "🏭 Shift Execution":
                     "Coils Done":  f"{r['coils_rolled']}/{r['total_coils']}",
                 } for r in filtered_shifts])
                 st.dataframe(sum_df, use_container_width=True, hide_index=True)
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE 8 — PRIORITY ADVISOR
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "🎯 Priority Advisor":
+    import pandas as pd
+    from priority_advisor import (
+        compute_priority, MODES, CONSUMER_URGENCY, SECTION_DOWNSTREAM
+    )
+
+    st.title("🎯 Production Priority Advisor")
+    st.caption(
+        "Upload today's WIP → select planning mode → get scored priority "
+        "sequence for CRM-04 and CRM-06 with shift briefing."
+    )
+
+    # ── Setup row ─────────────────────────────────────────────────
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        wip_pa = st.file_uploader("Upload WIP file", type=["xlsx"], key="wip_pa")
+    with col2:
+        mode = st.selectbox(
+            "Planning mode",
+            list(MODES.keys()),
+            format_func=lambda k: MODES[k],
+            index=0,
+        )
+        shift_no = st.selectbox("Shift", [1, 2, 3],
+            format_func=lambda x: {1:"Shift 1 (06-14h)",
+                                   2:"Shift 2 (14-22h)",
+                                   3:"Shift 3 (22-06h)"}[x])
+    with col3:
+        st.markdown("**Downstream demand level**")
+        st.caption("Set to HIGH if that stage is currently starved")
+        tube_demand = st.select_slider("Tube Plant (via CRS)",
+            options=[0.5, 1.0, 1.5, 2.0], value=1.0,
+            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
+                                   1.5:"Tight",2.0:"Starved"}[x],
+            help="Tube FH → CRS → Tube Plant")
+        ht_demand   = st.select_slider("H&T Line (direct)",
+            options=[0.5, 1.0, 1.5, 2.0], value=1.5,
+            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
+                                   1.5:"Tight",2.0:"Starved"}[x],
+            help="H&T Finish → directly to H&T Line, no CRS")
+        spm_demand  = st.select_slider("Skin Pass (direct)",
+            options=[0.5, 1.0, 1.5, 2.0], value=1.0,
+            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
+                                   1.5:"Tight",2.0:"Starved"}[x],
+            help="Skin Pass sections → directly to SPM, no CRS")
+        crs_demand  = st.select_slider("CRS (OEM/LG Bala)",
+            options=[0.5, 1.0, 1.5, 2.0], value=1.0,
+            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
+                                   1.5:"Tight",2.0:"Starved"}[x],
+            help="CRCA Finish → CRS → OEM or LG Bala dispatch")
+
+    if wip_pa and st.button("🎯 Compute Priority", type="primary",
+                             use_container_width=True):
+        with st.spinner("Analysing plan and scoring sections…"):
+            try:
+                import tempfile, os as _os
+                from generator import load_wip, filter_rolling_coils, \
+                                       assign_all, build_sections
+
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
+                    t.write(wip_pa.read()); wip_path = t.name
+
+                df       = load_wip(wip_path)
+                eligible = filter_rolling_coils(df)
+                assigned = assign_all(eligible, load_db())
+                sections = build_sections(assigned, load_db())
+                _os.unlink(wip_path)
+
+                downstream_demand = {
+                    'CRS → Tube Plant':   tube_demand,
+                    'H&T Line (direct)':  ht_demand,
+                    'Skin Pass (direct)': spm_demand,
+                    'CRS → OEM/Dispatch': crs_demand,
+                    'CRS → LG Bala':      crs_demand,
+                }
+
+                result = compute_priority(
+                    sections, mode=mode, shift_no=shift_no,
+                    downstream_demand=downstream_demand)
+
+                kpis = result['kpis']
+
+                # ── Global warnings ───────────────────────────────
+                for w in result['warnings']:
+                    st.warning(w)
+
+                # ── KPI metrics ───────────────────────────────────
+                st.subheader("📊 Today's Plan — Downstream Feed")
+                k1, k2, k3, k4, k5 = st.columns(5)
+                k1.metric("Via CRS → Tube Plant",
+                          f"{kpis['tube_mt']} MT",
+                          delta="urgent" if tube_demand >= 1.5 else None,
+                          delta_color="inverse",
+                          help="Tube FH → CRS → Tube Plant")
+                k2.metric("CRS total load",
+                          f"{kpis['crs_direct_mt']} MT",
+                          help="All material passing through CRS today")
+                k3.metric("H&T Line (direct)",
+                          f"{kpis['ht_mt']} MT",
+                          delta="starved" if ht_demand >= 1.5 else None,
+                          delta_color="inverse",
+                          help="H&T Finish → H&T Line directly, no CRS")
+                k4.metric("Skin Pass (direct)",
+                          f"{kpis['spm_mt']} MT",
+                          help="Skin Pass → SPM directly, no CRS")
+                k5.metric("→ Annealing (72h return)",
+                          f"{kpis['anneal_mt']} MT",
+                          help="Returns from annealing in ~72h")
+
+                st.divider()
+
+                # ── Priority sequences ────────────────────────────
+                col04, col06 = st.columns(2)
+
+                def _render_sequence(sections_list, mill_label):
+                    st.markdown(f"### 🏭 {mill_label} — Priority Sequence")
+                    for s in sections_list:
+                        score    = s.total_score
+                        color    = ("🔴" if score >= 75 else
+                                    "🟡" if score >= 50 else "🟢")
+                        with st.container():
+                            c1, c2, c3, c4 = st.columns([1, 4, 2, 2])
+                            c1.markdown(f"**#{s.rank_crm04 if 'CRM04' in s.mill else s.rank_crm06}**")
+                            c2.markdown(
+                                f"{color} **{s.section_key.replace('_',' ').title()}**  \n"
+                                f"<small>→ {s.downstream}</small>",
+                                unsafe_allow_html=True)
+                            c3.metric("MT", f"{s.total_mt:.1f}",
+                                      label_visibility="collapsed")
+                            c4.metric("Score", f"{score:.0f}/100",
+                                      label_visibility="collapsed")
+
+                        # Score breakdown bar
+                        score_df = pd.DataFrame({
+                            'Factor': ['Downstream','Customer','Age','Anneal','Production'],
+                            'Score':  [s.downstream_score, s.customer_score,
+                                       s.age_score, s.anneal_score, s.production_score],
+                        })
+                        st.progress(int(score), text=f"Overall: {score:.0f}/100")
+
+                        if s.warnings:
+                            for w in s.warnings:
+                                st.caption(w)
+
+                        with st.expander("Score breakdown", expanded=False):
+                            st.dataframe(score_df, use_container_width=True,
+                                         hide_index=True)
+                        st.divider()
+
+                with col04:
+                    _render_sequence(result['crm04_sequence'], "CRM-04")
+                with col06:
+                    _render_sequence(result['crm06_sequence'], "CRM-06")
+
+                # ── Shift briefing ────────────────────────────────
+                st.subheader("📱 Shift Briefing (WhatsApp-ready)")
+                st.code(result['briefing'], language="text")
+                st.download_button(
+                    "⬇️ Download briefing as .txt",
+                    data      = result['briefing'],
+                    file_name = f"shift_briefing_shift{shift_no}.txt",
+                    mime      = "text/plain",
+                    use_container_width=True,
+                )
+
+                # ── Mode comparison ───────────────────────────────
+                st.divider()
+                with st.expander("🔄 Compare all planning modes"):
+                    st.caption("Shows how scores change under each mode")
+                    comparison_rows = []
+                    for m in MODES:
+                        r = compute_priority(sections, mode=m,
+                                             shift_no=shift_no,
+                                             downstream_demand=downstream_demand)
+                        top04 = r['crm04_sequence'][0].section_key if r['crm04_sequence'] else '—'
+                        top06 = r['crm06_sequence'][0].section_key if r['crm06_sequence'] else '—'
+                        comparison_rows.append({
+                            'Mode':          MODES[m],
+                            'CRM04 #1':      top04.replace('_',' ').title(),
+                            'CRM06 #1':      top06.replace('_',' ').title(),
+                            'Direct MT':     r['kpis']['direct_mt'],
+                            'Anneal MT':     r['kpis']['anneal_mt'],
+                        })
+                    st.dataframe(pd.DataFrame(comparison_rows),
+                                 use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+                import traceback; st.code(traceback.format_exc())
+
+    elif not wip_pa:
+        st.info("👆 Upload today's WIP file to get priority recommendations.")
+
+        # Show mode guide
+        st.subheader("📖 Planning Modes Guide")
+        mode_guide = pd.DataFrame([
+            {"Mode": MODES[k],
+             "Use when": desc}
+            for k, desc in {
+                "BALANCED":    "Normal day — no specific crisis",
+                "TUBE_URGENT": "Tube Plant is calling for material urgently",
+                "HT_URGENT":   "H&T Line is idle or running low",
+                "MAX_PROD":    "Management pressure for maximum MT today",
+                "CLEAR_BACKLOG":"Old coils piling up — TDC expiry risk",
+                "FEED_ANNEAL": "Annealing furnace starved — feed it now for 72h return",
+            }.items()
+        ])
+        st.dataframe(mode_guide, use_container_width=True, hide_index=True)
