@@ -1663,7 +1663,11 @@ elif page == "🎯 Priority Advisor":
                                    1.5:"Tight",2.0:"Starved"}[x],
             help="CRCA Finish → CRS → OEM or LG Bala dispatch")
 
-    if wip_pa and st.button("🎯 Compute Priority", type="primary",
+    # ── Tabs ─────────────────────────────────────────────────────────
+    tab_priority, tab_crs = st.tabs(["🎯 Priority Scoring", "🔧 CRS Setting Optimiser"])
+
+    with tab_priority:
+     if wip_pa and st.button("🎯 Compute Priority", type="primary",
                              use_container_width=True):
         with st.spinner("Analysing plan and scoring sections…"):
             try:
@@ -1802,21 +1806,149 @@ elif page == "🎯 Priority Advisor":
                 st.error(f"Error: {e}")
                 import traceback; st.code(traceback.format_exc())
 
-    elif not wip_pa:
+     elif not wip_pa:
         st.info("👆 Upload today's WIP file to get priority recommendations.")
-
-        # Show mode guide
         st.subheader("📖 Planning Modes Guide")
         mode_guide = pd.DataFrame([
-            {"Mode": MODES[k],
-             "Use when": desc}
+            {"Mode": MODES[k], "Use when": desc}
             for k, desc in {
-                "BALANCED":    "Normal day — no specific crisis",
-                "TUBE_URGENT": "Tube Plant is calling for material urgently",
-                "HT_URGENT":   "H&T Line is idle or running low",
-                "MAX_PROD":    "Management pressure for maximum MT today",
+                "BALANCED":     "Normal day — no specific crisis",
+                "TUBE_URGENT":  "Tube Plant calling for material urgently",
+                "HT_URGENT":    "H&T Line is idle or running low",
+                "MAX_PROD":     "Management pressure for maximum MT today",
                 "CLEAR_BACKLOG":"Old coils piling up — TDC expiry risk",
-                "FEED_ANNEAL": "Annealing furnace starved — feed it now for 72h return",
+                "FEED_ANNEAL":  "Annealing furnace starved — feed it now for 72h return",
             }.items()
         ])
         st.dataframe(mode_guide, use_container_width=True, hide_index=True)
+
+    with tab_crs:
+        st.subheader("🔧 CRS Setting Change Optimiser")
+        st.caption(
+            "Finds the coil sequence at CRS that minimises width/thickness "
+            "setting changes — reducing downtime and improving throughput."
+        )
+
+        if wip_pa:
+            if st.button("🔧 Optimise CRS Sequence", type="primary",
+                         use_container_width=True, key="crs_btn"):
+                with st.spinner("Finding optimal CRS sequence…"):
+                    try:
+                        import tempfile, os as _os
+                        from generator import load_wip, filter_rolling_coils,                                                assign_all, build_sections
+                        from priority_advisor import optimise_crs_sequence
+
+                        # Re-read WIP (already uploaded above)
+                        wip_pa.seek(0)
+                        with tempfile.NamedTemporaryFile(suffix=".xlsx",
+                                                         delete=False) as t:
+                            t.write(wip_pa.read()); wip_path = t.name
+
+                        df2      = load_wip(wip_path)
+                        eligible = filter_rolling_coils(df2)
+                        assigned = assign_all(eligible, load_db())
+                        sections = build_sections(assigned, load_db())
+                        _os.unlink(wip_path)
+
+                        crs = optimise_crs_sequence(sections)
+
+                        if 'error' in crs:
+                            st.error(crs['error'])
+                        else:
+                            # ── Summary metrics ───────────────────────
+                            m1, m2, m3, m4 = st.columns(4)
+                            m1.metric("Total CRS coils", crs['total_coils'])
+                            m2.metric("Total MT",        f"{crs['total_mt']} MT")
+                            m3.metric("Changes (current)", crs['original_changes'])
+                            m4.metric("Changes (optimised)",
+                                      crs['optimised_changes'],
+                                      delta=f"-{crs['changes_saved']}",
+                                      delta_color="inverse"
+                                      if crs['changes_saved'] > 0 else "off")
+
+                            for r in crs['recommendations']:
+                                if r.startswith("✅"):
+                                    st.success(r)
+                                elif r.startswith("⚠️"):
+                                    st.warning(r)
+                                else:
+                                    st.info(r)
+
+                            st.divider()
+
+                            # ── Optimised sequence table ──────────────
+                            st.subheader("Optimised CRS Running Sequence")
+                            st.caption(
+                                "Run coils in this order at CRS for minimum "
+                                "setting changes. Green = no change from previous. "
+                                "Red = setting change required.")
+
+                            seq_rows = []
+                            for i, c in enumerate(crs['optimised_sequence'], 1):
+                                is_change = any(
+                                    e['position'] == i-1
+                                    for e in crs['change_events'])
+                                change_desc = ""
+                                for e in crs['change_events']:
+                                    if e['position'] == i-1:
+                                        change_desc = " | ".join(e['changes'])
+                                seq_rows.append({
+                                    "Pos":       i,
+                                    "Coil":      c['coil_number'],
+                                    "Width (mm)":c['width'],
+                                    "Thick (mm)":c['thick'],
+                                    "Product":   c['product'],
+                                    "Customer":  c['customer'][:15],
+                                    "MT":        round(c['weight'], 3),
+                                    "⚠️ Change": change_desc,
+                                })
+                            seq_df = pd.DataFrame(seq_rows)
+                            st.dataframe(seq_df, use_container_width=True,
+                                         hide_index=True)
+
+                            # ── Change events detail ──────────────────
+                            if crs['change_events']:
+                                st.divider()
+                                st.subheader(
+                                    f"Setting Change Events "
+                                    f"({len(crs['change_events'])} changes)")
+                                for e in crs['change_events']:
+                                    color = "🔴" if e['is_major'] else "🟡"
+                                    with st.expander(
+                                        f"{color} After position {e['position']}: "
+                                        f"{e['from_coil']} → {e['to_coil']}  "
+                                        f"(cost: {e['change_cost']:.1f})",
+                                            expanded=e['is_major']):
+                                        for ch in e['changes']:
+                                            st.write(f"• {ch}")
+
+                            # ── Download sequence ─────────────────────
+                            st.download_button(
+                                "⬇️ Download CRS sequence as CSV",
+                                data=seq_df.to_csv(index=False),
+                                file_name="crs_sequence.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+
+                    except Exception as e:
+                        st.error(f"CRS optimiser error: {e}")
+                        import traceback; st.code(traceback.format_exc())
+        else:
+            st.info("👆 Upload the WIP file in the Priority Scoring tab first.")
+
+            st.subheader("📖 What counts as a CRS setting change?")
+            st.markdown("""
+| Change type | Effort | Time lost |
+|---|---|---|
+| Width change > 2mm | Guide adjustment | ~5 min |
+| Thickness change > 0.05mm | Pressure/tension reset | ~8 min |
+| Product change C09 → C01 | Full setup change | ~15 min |
+| Customer change | Label/inspection change | ~2 min |
+
+**Key rule:** Group same-width coils together regardless of section.  
+Running 470mm Tube FH → 470mm Tube FH = 0 changes.  
+Running 470mm Tube FH → 433mm LG Bala = 1 width change.  
+Running 470mm Tube FH → 410mm Tube FH → 433mm LG Bala = 2 changes.  
+Optimal: 470mm → 433mm → 425mm → 410mm = 3 changes for 30 coils.
+            """)
