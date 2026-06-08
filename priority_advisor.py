@@ -500,3 +500,222 @@ def _generate_briefing(crm04, crm06, kpis, warnings,
         "📌 *NOTE*: This is a recommendation. Shift-in-charge has final call.",
     ]
     return '\n'.join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CRS OPTIMISER — Minimum Setting Changes
+# ══════════════════════════════════════════════════════════════════════════════
+
+# What constitutes a CRS setting change:
+# 1. Width change > 2mm  (requires guide adjustment)
+# 2. Thickness change > 0.05mm (requires pressure/tension adjustment)
+# 3. Product change C09 → C01 (requires blade/tension setup change) — MAJOR
+# 4. Customer change (requires label/inspection setup) — MINOR
+#
+# Weights for change cost:
+CRS_CHANGE_COST = {
+    'width_per_mm':    0.5,   # cost per mm of width change
+    'thick_per_0.1mm': 2.0,   # cost per 0.1mm thickness change
+    'product_change':  10.0,  # C09 ↔ C01 is a major setup
+    'customer_change':  1.0,  # label / inspection change only
+}
+
+
+def _crs_change_cost(coil_a: dict, coil_b: dict) -> float:
+    """
+    Compute the setup cost of running coil_b immediately after coil_a at CRS.
+    Lower = better (fewer / cheaper changes).
+    """
+    cost = 0.0
+
+    w_diff = abs(coil_a['width'] - coil_b['width'])
+    t_diff = abs(coil_a['thick'] - coil_b['thick'])
+    cost += w_diff * CRS_CHANGE_COST['width_per_mm']
+    cost += (t_diff / 0.1) * CRS_CHANGE_COST['thick_per_0.1mm']
+
+    if coil_a.get('product') != coil_b.get('product'):
+        cost += CRS_CHANGE_COST['product_change']
+
+    if coil_a.get('customer') != coil_b.get('customer'):
+        cost += CRS_CHANGE_COST['customer_change']
+
+    return round(cost, 2)
+
+
+def _count_changes(sequence: list) -> int:
+    """Count number of actual setting changes in a CRS sequence."""
+    changes = 0
+    for i in range(len(sequence) - 1):
+        a, b = sequence[i], sequence[i + 1]
+        if (abs(a['width'] - b['width']) > 2 or
+                abs(a['thick'] - b['thick']) > 0.05 or
+                a.get('product') != b.get('product')):
+            changes += 1
+    return changes
+
+
+def optimise_crs_sequence(sections: list) -> dict:
+    """
+    Given today's plan sections, find the CRS coil sequence that
+    minimises total setting changes using a nearest-neighbour greedy
+    optimiser with 2-opt improvement.
+
+    Parameters
+    ----------
+    sections : section dicts from generator.build_sections()
+
+    Returns
+    -------
+    dict with:
+        original_sequence   : coils in current plan order
+        optimised_sequence  : coils in CRS-optimal order
+        original_changes    : number of setting changes in original
+        optimised_changes   : number of setting changes in optimised
+        changes_saved       : reduction
+        total_cost_original : weighted cost score
+        total_cost_optimised: weighted cost score
+        change_events       : list of change events in optimised sequence
+        width_groups        : coils grouped by width band
+        recommendations     : actionable text
+    """
+    via_crs = ['TUBE_FH', 'CRCA_FINISH', 'CRCA_FINISH_CRM06']
+
+    # Build flat coil list for CRS
+    crs_coils = []
+    for s in sections:
+        if s['section_key'] not in via_crs:
+            continue
+        for _, row in s['coils_df'].iterrows():
+            crs_coils.append({
+                'coil_number': str(row.get('Coil Number', '')),
+                'width':       float(row.get('Actual Width', 0)),
+                'thick':       float(row.get('Plan Rolling Thick 1', 0)),
+                'weight':      float(row.get('Input Coil Weight', 0)),
+                'product':     str(row.get('Product Code', '')),
+                'customer':    str(row.get('Customer Desc', '')).strip()[:20],
+                'section':     s['section_key'],
+                'age':         float(row.get('Coil Age(# Days)', 0)),
+            })
+
+    if not crs_coils:
+        return {'error': 'No CRS coils in plan'}
+
+    # Original sequence cost
+    orig_cost    = sum(_crs_change_cost(crs_coils[i], crs_coils[i+1])
+                       for i in range(len(crs_coils)-1))
+    orig_changes = _count_changes(crs_coils)
+
+    # ── Greedy nearest-neighbour ──────────────────────────────────────
+    def greedy_from(start_idx):
+        remaining = crs_coils[:]
+        seq = [remaining.pop(start_idx)]
+        while remaining:
+            last = seq[-1]
+            best = min(remaining,
+                       key=lambda c: _crs_change_cost(last, c))
+            seq.append(best)
+            remaining.remove(best)
+        return seq
+
+    best_seq  = crs_coils[:]
+    best_cost = orig_cost
+    for i in range(len(crs_coils)):
+        seq  = greedy_from(i)
+        cost = sum(_crs_change_cost(seq[j], seq[j+1])
+                   for j in range(len(seq)-1))
+        if cost < best_cost:
+            best_cost = cost
+            best_seq  = seq
+
+    # ── 2-opt improvement ─────────────────────────────────────────────
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, len(best_seq) - 1):
+            for j in range(i + 1, len(best_seq)):
+                new_seq = best_seq[:i] + best_seq[i:j+1][::-1] + best_seq[j+1:]
+                new_cost = sum(_crs_change_cost(new_seq[k], new_seq[k+1])
+                               for k in range(len(new_seq)-1))
+                if new_cost < best_cost - 0.01:
+                    best_seq  = new_seq
+                    best_cost = new_cost
+                    improved  = True
+
+    opt_changes = _count_changes(best_seq)
+    saved       = orig_changes - opt_changes
+
+    # ── Build change event list ───────────────────────────────────────
+    change_events = []
+    for i in range(len(best_seq) - 1):
+        a, b = best_seq[i], best_seq[i+1]
+        events = []
+        w_diff = abs(a['width'] - b['width'])
+        t_diff = abs(a['thick'] - b['thick'])
+        if w_diff > 2:
+            events.append(f"Width: {a['width']:.0f}→{b['width']:.0f}mm "
+                          f"(Δ{w_diff:.0f}mm)")
+        if t_diff > 0.05:
+            events.append(f"Thickness: {a['thick']:.2f}→{b['thick']:.2f}mm "
+                          f"(Δ{t_diff:.2f}mm)")
+        if a['product'] != b['product']:
+            events.append(f"Product: {a['product']}→{b['product']} ⚠️ MAJOR")
+        if events:
+            change_events.append({
+                'position':    i + 1,
+                'from_coil':   a['coil_number'],
+                'to_coil':     b['coil_number'],
+                'from_width':  a['width'],
+                'to_width':    b['width'],
+                'from_thick':  a['thick'],
+                'to_thick':    b['thick'],
+                'changes':     events,
+                'change_cost': _crs_change_cost(a, b),
+                'is_major':    a['product'] != b['product'],
+            })
+
+    # ── Width group summary ───────────────────────────────────────────
+    from collections import defaultdict
+    width_groups = defaultdict(list)
+    for c in best_seq:
+        band = f"{int(round(c['width']/10)*10)} mm band"
+        width_groups[band].append(c)
+
+    # ── Recommendations ───────────────────────────────────────────────
+    recs = []
+    if saved > 0:
+        recs.append(
+            f"✅ Resequencing saves {saved} setting change(s) "
+            f"({orig_changes} → {opt_changes}) — "
+            f"estimated {saved * 8:.0f} min less downtime at CRS")
+    else:
+        recs.append("✅ Current sequence is already optimal for CRS")
+
+    major = [e for e in change_events if e['is_major']]
+    if major:
+        recs.append(
+            f"⚠️ {len(major)} product change(s) (C09↔C01) are unavoidable "
+            f"— these require full CRS setup. "
+            f"Schedule these at shift start or after a break.")
+
+    # Width cascade check
+    widths = [c['width'] for c in best_seq]
+    if all(widths[i] >= widths[i+1] - 2 for i in range(len(widths)-1)):
+        recs.append("✅ Width cascade maintained throughout CRS sequence")
+    else:
+        recs.append("⚠️ Some width step-ups in optimised sequence — "
+                    "check roll edge condition before running narrow→wide")
+
+    return {
+        'original_sequence':    crs_coils,
+        'optimised_sequence':   best_seq,
+        'original_changes':     orig_changes,
+        'optimised_changes':    opt_changes,
+        'changes_saved':        saved,
+        'total_cost_original':  round(orig_cost, 1),
+        'total_cost_optimised': round(best_cost, 1),
+        'change_events':        change_events,
+        'width_groups':         dict(width_groups),
+        'recommendations':      recs,
+        'total_coils':          len(crs_coils),
+        'total_mt':             round(sum(c['weight'] for c in crs_coils), 2),
+    }
