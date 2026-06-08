@@ -1,6 +1,6 @@
 # Tata Steel CRM Sahibabad — Narrow Complex Mill Planner
 
-An intelligent, self-learning daily rolling mill plan generator for the Narrow Complex at Tata Steel CRM Sahibabad. Converts a daily WIP (Work-In-Progress) coil staging export from SAP into a fully formatted, section-wise rolling plan — matching the manually prepared format exactly — and improves accuracy every day through machine learning and planner corrections.
+An intelligent, self-learning daily rolling mill plan generator for the Narrow Complex at Tata Steel CRM Sahibabad. Converts a daily WIP (Work-In-Progress) coil staging export from MES into a fully formatted, section-wise rolling plan — matching the manually prepared format exactly — and improves accuracy every day through machine learning and planner corrections.
 
 ---
 
@@ -12,7 +12,7 @@ An intelligent, self-learning daily rolling mill plan generator for the Narrow C
 
 ## What it does
 
-Upload today's WIP file from SAP → the system generates a complete rolling plan in seconds:
+Upload today's WIP file from MES → the system generates a complete rolling plan in seconds:
 
 - **100 coils / 843 MT** matched against actual planner output
 - **96.6%+ inclusion accuracy** — right coils, right sections
@@ -25,7 +25,7 @@ Upload today's WIP file from SAP → the system generates a complete rolling pla
 ## System Architecture
 
 ```
-SAP WIP Export (.xlsx)
+MES WIP Export (.xlsx)
         │
         ▼
 ┌─────────────────────────────────────────────────────┐
@@ -109,11 +109,11 @@ Only coils passing **all** these checks enter the plan:
 
 | Rule | Detail |
 |---|---|
-| **Current Stage** | Must be exactly `ROLLING MILL` in SAP |
-| **Weight** | ≥ 0.5 MT (excludes SAP continuation stubs) |
+| **Current Stage** | Must be exactly `ROLLING MILL` in MES |
+| **Weight** | ≥ 0.5 MT (excludes MES continuation stubs) |
 | **HC80 old** | Excluded if Age ≥ 20 days AND Actual Thick < Plan RT (deferred) |
 | **TATFHC/RC01** | Excluded unless Planning Remark contains "FH" (new arrival, not in campaign) |
-| **PP-PENDING** | Excluded unless Quality = TATFHC (campaign coil with SAP lag) |
+| **PP-PENDING** | Excluded unless Quality = TATFHC (campaign coil with MES lag) |
 | **TATXXD→S-SPM** | Excluded (already at target, waiting for Skin Pass) |
 | **TSBH62 far below target** | Excluded if RT − Actual Thick > 0.8mm (planner defers) |
 | **Standalone HOLD** | Excluded if "hold" appears as standalone word in remark |
@@ -209,7 +209,7 @@ The rule engine evaluates each coil in order — first matching rule wins:
 ### Mill Assignment for ROLLING Section
 
 When both mills run ROLLING on the same day, coils are split by:
-1. Work Center code from SAP (most reliable)
+1. Work Center code from MES (most reliable)
 2. Thickness heuristic: heavier gauge → CRM04, lighter → CRM06
 3. No fixed rule — planner distributes by load judgment
 
@@ -359,7 +359,7 @@ The page includes a "Compare all modes" expander that runs all 6 modes simultane
 
 ### Shift Briefing Output
 
-Generates a WhatsApp-ready text block with:
+Generates a WhatMESp-ready text block with:
 - Shift number and planning mode
 - MT breakdown by downstream consumer (CRS load, direct H&T, direct Skin Pass, annealing feed)
 - Priority sequence for CRM-04 and CRM-06 with scores
