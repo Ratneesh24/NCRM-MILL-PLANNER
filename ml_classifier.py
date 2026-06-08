@@ -389,7 +389,7 @@ class SectionClassifier:
         try:
             import xgboost as xgb
             m1 = xgb.XGBClassifier(
-                n_estimators=400, max_depth=6, learning_rate=0.08,
+                n_estimators=150, max_depth=6, learning_rate=0.12,
                 subsample=0.8, colsample_bytree=0.75,
                 min_child_weight=2, gamma=0.05,
                 reg_alpha=0.1, reg_lambda=1.0,
@@ -409,7 +409,7 @@ class SectionClassifier:
         try:
             import lightgbm as lgb
             m2 = lgb.LGBMClassifier(
-                n_estimators=400, max_depth=6, learning_rate=0.08,
+                n_estimators=150, max_depth=6, learning_rate=0.12,
                 num_leaves=31, subsample=0.8, colsample_bytree=0.75,
                 min_child_samples=2, reg_alpha=0.1, reg_lambda=1.0,
                 objective='multiclass', num_class=n_cls,
@@ -427,7 +427,7 @@ class SectionClassifier:
         try:
             from catboost import CatBoostClassifier
             m3 = CatBoostClassifier(
-                iterations=400, depth=6, learning_rate=0.08,
+                iterations=150, depth=6, learning_rate=0.12,
                 loss_function='MultiClass', classes_count=n_cls,
                 random_seed=42, verbose=0,
                 l2_leaf_reg=3, bagging_temperature=0.8,
@@ -453,7 +453,7 @@ class SectionClassifier:
             try:
                 from sklearn.model_selection import StratifiedKFold
                 from sklearn.metrics import accuracy_score
-                cv = StratifiedKFold(n_splits=min(5, actual_mask.sum()//4),
+                cv = StratifiedKFold(n_splits=min(3, actual_mask.sum()//4),
                                      shuffle=True, random_state=42)
                 cv_X = X_df[actual_mask]
                 cv_y = y_m[actual_mask]
