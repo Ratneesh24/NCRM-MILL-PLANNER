@@ -719,3 +719,181 @@ def optimise_crs_sequence(sections: list) -> dict:
         'total_coils':          len(crs_coils),
         'total_mt':             round(sum(c['weight'] for c in crs_coils), 2),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOWNSTREAM DEPLETION FORECASTER — predict when H&T / CRS / SPM run out
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Daily consumption capacity of each downstream stage (MT/day)
+# These are editable defaults — adjust in the UI to match actual rates
+DEFAULT_CONSUMPTION = {
+    'CRS':       110.0,   # C R Slitter throughput MT/day
+    'H&T':        45.0,   # H&T furnace line MT/day
+    'SPM':        60.0,   # Skin Pass Mill MT/day
+    'Annealing': 130.0,   # BAF charge capacity MT/day
+}
+
+# Which Current Stage values count as buffer for each consumer
+BUFFER_STAGES = {
+    'CRS':       ['C R SLITTER'],
+    'H&T':       ['FURNACE'],
+    'SPM':       ['SPM'],
+    'Annealing': ['ANB', 'ANNEALING'],
+}
+
+# Which plan sections add to each consumer's buffer (today's rolling output)
+SECTION_FEEDS = {
+    'CRS':       ['TUBE_FH', 'CRCA_FINISH', 'CRCA_FINISH_CRM06'],
+    'H&T':       ['HT_FINISH'],
+    'SPM':       ['SKIN_PASS_SUPER_BRIGHT', 'SKIN_PASS_CHROME',
+                  'SKIN_PASS_HEAVY_MATT'],
+    'Annealing': ['RE_ROLLING', 'FIRST_ROLLING', 'ROLLING'],
+}
+
+ALERT_DAYS = {'critical': 1.0, 'warning': 2.0, 'watch': 3.5}
+
+
+def forecast_depletion(wip_df, sections,
+                       consumption: dict = None,
+                       horizon_days: int = 7) -> dict:
+    """
+    Forecast when each downstream consumer's buffer runs out.
+
+    Parameters
+    ----------
+    wip_df      : FULL raw WIP DataFrame (all stages, not just Rolling Mill)
+    sections    : today's plan sections from build_sections()
+    consumption : {consumer: MT/day} — override defaults
+    horizon_days: forecast window
+
+    Returns dict per consumer:
+        buffer_mt, buffer_coils, incoming_today_mt, consumption_rate,
+        days_to_empty, empty_date, status, day_by_day projection
+    """
+    import pandas as _pd
+    from datetime import datetime, timedelta
+
+    cons = dict(DEFAULT_CONSUMPTION)
+    if consumption:
+        cons.update(consumption)
+
+    wip = wip_df.copy()
+    wip.columns = wip.columns.str.strip()
+    wip['Input Coil Weight'] = _pd.to_numeric(
+        wip['Input Coil Weight'], errors='coerce').fillna(0)
+    # Some rows have weight in kg — normalise anything > 100 to MT
+    wip.loc[wip['Input Coil Weight'] > 100, 'Input Coil Weight'] /= 1000.0
+
+    # Today's plan output by consumer
+    plan_feed = {k: 0.0 for k in SECTION_FEEDS}
+    for s in sections:
+        for consumer, sec_keys in SECTION_FEEDS.items():
+            if s['section_key'] in sec_keys:
+                plan_feed[consumer] += float(
+                    s['coils_df']['Input Coil Weight'].sum())
+
+    results = {}
+    today = datetime.now().date()
+
+    for consumer, stages in BUFFER_STAGES.items():
+        buf = wip[wip['Current Stage'].isin(stages)]
+        buffer_mt    = round(float(buf['Input Coil Weight'].sum()), 1)
+        buffer_coils = len(buf)
+        rate         = cons.get(consumer, 50.0)
+        incoming     = round(plan_feed.get(consumer, 0.0), 1)
+
+        # Annealing 72h return: today's anneal feed reaches CRS/H&T at day 3
+        # Simple projection: buffer + today's incoming, drain at `rate`/day
+        projection = []
+        level = buffer_mt
+        empty_day = None
+        for d in range(horizon_days + 1):
+            if d == 0:
+                level += incoming   # today's rolling lands in buffer
+            else:
+                level -= rate
+            level = max(level, 0.0)
+            projection.append({'day': d,
+                               'date': str(today + timedelta(days=d)),
+                               'buffer_mt': round(level, 1)})
+            if empty_day is None and level <= 0:
+                empty_day = d
+
+        days_to_empty = round((buffer_mt + incoming) / rate, 1) if rate else 99
+        if   days_to_empty <= ALERT_DAYS['critical']: status = 'CRITICAL'
+        elif days_to_empty <= ALERT_DAYS['warning']:  status = 'WARNING'
+        elif days_to_empty <= ALERT_DAYS['watch']:    status = 'WATCH'
+        else:                                          status = 'OK'
+
+        # How much must be rolled today to keep N days of cover
+        target_cover_days = 3.0
+        required_today = max(0.0, round(
+            target_cover_days * rate - buffer_mt, 1))
+
+        results[consumer] = {
+            'buffer_mt':        buffer_mt,
+            'buffer_coils':     buffer_coils,
+            'incoming_today_mt': incoming,
+            'consumption_rate': rate,
+            'days_to_empty':    days_to_empty,
+            'empty_date':       (str(today + timedelta(days=int(days_to_empty)))
+                                 if days_to_empty < horizon_days else None),
+            'status':           status,
+            'required_today_mt': required_today,
+            'projection':       projection,
+        }
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDERED ROLLING SHEET — printable per-mill coil list with section headers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_rolling_sheet(sections, priority_result=None) -> dict:
+    """
+    Build an ordered, header-grouped rolling list per mill.
+    If priority_result is given (from compute_priority), sections are
+    ordered by priority rank; otherwise plan order is kept.
+
+    Returns {'CRM04': [...], 'CRM06': [...]} where each item is either
+    {'type':'header', ...} or {'type':'coil', ...} — ready for UI/print.
+    """
+    rank_map = {}
+    if priority_result:
+        for s in priority_result.get('crm04_sequence', []):
+            rank_map[('CRM04', s.section_key)] = s.rank_crm04
+        for s in priority_result.get('crm06_sequence', []):
+            rank_map[('CRM06', s.section_key)] = s.rank_crm06
+
+    sheets = {'CRM04': [], 'CRM06': []}
+    for mill in ('CRM04', 'CRM06'):
+        mill_secs = [s for s in sections if s['mill'] == mill]
+        mill_secs.sort(key=lambda s: rank_map.get((mill, s['section_key']), 99))
+
+        running_no = 0
+        for rank_i, s in enumerate(mill_secs, 1):
+            df = s['coils_df']
+            sheets[mill].append({
+                'type':       'header',
+                'priority':   rank_i,
+                'section':    s['section_key'],
+                'label':      s['label'],
+                'coil_count': len(df),
+                'total_mt':   round(float(df['Input Coil Weight'].sum()), 1),
+            })
+            for _, r in df.iterrows():
+                running_no += 1
+                sheets[mill].append({
+                    'type':     'coil',
+                    'seq':      running_no,
+                    'coil':     str(r.get('Coil Number', '')),
+                    'width':    float(r.get('Actual Width', 0) or 0),
+                    'thick':    float(r.get('Actual Thick', 0) or 0),
+                    'rt':       float(r.get('Plan Rolling Thick 1', 0) or 0),
+                    'weight':   round(float(r.get('Input Coil Weight', 0) or 0), 3),
+                    'customer': str(r.get('Customer Desc', ''))[:18],
+                    'remark':   str(r.get('Planning Remark', ''))[:25],
+                })
+    return sheets
