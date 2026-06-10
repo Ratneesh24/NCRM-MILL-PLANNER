@@ -1664,7 +1664,9 @@ elif page == "🎯 Priority Advisor":
             help="CRCA Finish → CRS → OEM or LG Bala dispatch")
 
     # ── Tabs ─────────────────────────────────────────────────────────
-    tab_priority, tab_crs = st.tabs(["🎯 Priority Scoring", "🔧 CRS Setting Optimiser"])
+    tab_priority, tab_crs, tab_forecast, tab_sheet = st.tabs(
+        ["🎯 Priority Scoring", "🔧 CRS Setting Optimiser",
+         "📉 Depletion Forecast", "📄 Rolling Sheet"])
 
     with tab_priority:
      if wip_pa and st.button("🎯 Compute Priority", type="primary",
@@ -1952,3 +1954,173 @@ Running 470mm Tube FH → 433mm LG Bala = 1 width change.
 Running 470mm Tube FH → 410mm Tube FH → 433mm LG Bala = 2 changes.  
 Optimal: 470mm → 433mm → 425mm → 410mm = 3 changes for 30 coils.
             """)
+
+    # ── TAB 3: DEPLETION FORECAST ─────────────────────────────────────
+    with tab_forecast:
+        st.subheader("📉 Downstream Buffer Depletion Forecast")
+        st.caption(
+            "Predicts when H&T, CRS, SPM and Annealing will run out of "
+            "material based on current WIP buffers + today's plan output."
+        )
+
+        if wip_pa:
+            st.markdown("**Consumption rates (MT/day)** — adjust to actuals:")
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            crs_rate = rc1.number_input("CRS",       value=110.0, step=5.0, key="dr_crs")
+            ht_rate  = rc2.number_input("H&T",       value=45.0,  step=5.0, key="dr_ht")
+            spm_rate = rc3.number_input("SPM",       value=60.0,  step=5.0, key="dr_spm")
+            ann_rate = rc4.number_input("Annealing", value=130.0, step=5.0, key="dr_ann")
+
+            if st.button("📉 Forecast Depletion", type="primary",
+                         use_container_width=True, key="fc_btn"):
+                with st.spinner("Analysing WIP buffers…"):
+                    try:
+                        import tempfile, os as _os, pandas as _pd
+                        from generator import load_wip, filter_rolling_coils, \
+                                               assign_all, build_sections
+                        from priority_advisor import forecast_depletion
+
+                        wip_pa.seek(0)
+                        with tempfile.NamedTemporaryFile(suffix=".xlsx",
+                                                          delete=False) as t:
+                            t.write(wip_pa.read()); fp = t.name
+
+                        raw_full = _pd.read_excel(fp)
+                        df3      = load_wip(fp)
+                        secs3    = build_sections(
+                            assign_all(filter_rolling_coils(df3), load_db()),
+                            load_db())
+                        _os.unlink(fp)
+
+                        fc = forecast_depletion(raw_full, secs3, consumption={
+                            'CRS': crs_rate, 'H&T': ht_rate,
+                            'SPM': spm_rate, 'Annealing': ann_rate})
+
+                        STATUS_ICON = {'CRITICAL': '🔴', 'WARNING': '🟠',
+                                       'WATCH': '🟡', 'OK': '🟢'}
+
+                        cols = st.columns(len(fc))
+                        for col, (consumer, r) in zip(cols, fc.items()):
+                            with col:
+                                st.markdown(
+                                    f"### {STATUS_ICON[r['status']]} {consumer}")
+                                st.metric("Buffer now",
+                                          f"{r['buffer_mt']} MT",
+                                          f"{r['buffer_coils']} coils",
+                                          delta_color="off")
+                                st.metric("Days to empty",
+                                          f"{r['days_to_empty']} days",
+                                          r['empty_date'] or "beyond 7d",
+                                          delta_color="off")
+                                st.metric("+ Today's plan feeds",
+                                          f"{r['incoming_today_mt']} MT")
+                                if r['required_today_mt'] > 0:
+                                    st.warning(
+                                        f"Need **{r['required_today_mt']} MT** "
+                                        f"rolled today for 3-day cover")
+                                else:
+                                    st.success("3-day cover secured ✅")
+
+                        # Projection chart
+                        st.divider()
+                        st.subheader("7-Day Buffer Projection")
+                        proj_rows = []
+                        for consumer, r in fc.items():
+                            for p in r['projection']:
+                                proj_rows.append({'Day': p['date'],
+                                                  'Consumer': consumer,
+                                                  'Buffer MT': p['buffer_mt']})
+                        proj_df = pd.DataFrame(proj_rows)
+                        pivot = proj_df.pivot(index='Day', columns='Consumer',
+                                              values='Buffer MT')
+                        st.line_chart(pivot)
+                        st.caption(
+                            "Assumes today's plan output lands in buffer on day 0, "
+                            "then drains at the set consumption rate. Lines hitting "
+                            "zero = stage starves on that date.")
+
+                    except Exception as e:
+                        st.error(f"Forecast error: {e}")
+                        import traceback; st.code(traceback.format_exc())
+        else:
+            st.info("👆 Upload the WIP file in the Priority Scoring tab first.")
+
+    # ── TAB 4: ROLLING SHEET ──────────────────────────────────────────
+    with tab_sheet:
+        st.subheader("📄 Ordered Rolling Sheet — Shop Floor Copy")
+        st.caption(
+            "Coil-by-coil rolling order per mill, grouped under priority "
+            "section headers. Download as CSV and print for the operators."
+        )
+
+        if wip_pa:
+            sheet_mode  = st.selectbox("Order sections by", list(MODES.keys()),
+                            format_func=lambda k: MODES[k], key="sheet_mode")
+            sheet_shift = st.selectbox("Shift", [1, 2, 3], key="sheet_shift")
+
+            if st.button("📄 Build Rolling Sheet", type="primary",
+                         use_container_width=True, key="sheet_btn"):
+                with st.spinner("Building rolling sheet…"):
+                    try:
+                        import tempfile, os as _os
+                        from generator import load_wip, filter_rolling_coils, \
+                                               assign_all, build_sections
+                        from priority_advisor import (compute_priority,
+                                                       build_rolling_sheet)
+                        wip_pa.seek(0)
+                        with tempfile.NamedTemporaryFile(suffix=".xlsx",
+                                                          delete=False) as t:
+                            t.write(wip_pa.read()); fp = t.name
+                        df4   = load_wip(fp)
+                        secs4 = build_sections(
+                            assign_all(filter_rolling_coils(df4), load_db()),
+                            load_db())
+                        _os.unlink(fp)
+
+                        pr4    = compute_priority(secs4, mode=sheet_mode,
+                                                  shift_no=sheet_shift)
+                        sheets = build_rolling_sheet(secs4, pr4)
+
+                        col04, col06 = st.columns(2)
+                        for col, mill in [(col04, 'CRM04'), (col06, 'CRM06')]:
+                            with col:
+                                st.markdown(f"## 🏭 {mill}")
+                                csv_rows = []
+                                for item in sheets[mill]:
+                                    if item['type'] == 'header':
+                                        st.markdown(
+                                            f"#### ⬛ Priority {item['priority']} — "
+                                            f"{item['section'].replace('_',' ').title()}"
+                                            f"  \n<small>{item['coil_count']} coils · "
+                                            f"{item['total_mt']} MT</small>",
+                                            unsafe_allow_html=True)
+                                        csv_rows.append({
+                                            'Seq': '', 'Coil': f"=== P{item['priority']}: "
+                                            f"{item['section']} ===",
+                                            'Width': '', 'Thick': '', 'RT': '',
+                                            'MT': item['total_mt'],
+                                            'Customer': '', 'Remark': ''})
+                                    else:
+                                        csv_rows.append({
+                                            'Seq': item['seq'], 'Coil': item['coil'],
+                                            'Width': item['width'],
+                                            'Thick': item['thick'], 'RT': item['rt'],
+                                            'MT': item['weight'],
+                                            'Customer': item['customer'],
+                                            'Remark': item['remark']})
+                                sheet_df = pd.DataFrame(
+                                    [r for r in csv_rows if r['Seq'] != ''])
+                                st.dataframe(sheet_df, use_container_width=True,
+                                             hide_index=True, height=420)
+                                st.download_button(
+                                    f"⬇️ {mill} sheet (CSV)",
+                                    data=pd.DataFrame(csv_rows).to_csv(index=False),
+                                    file_name=f"rolling_sheet_{mill}.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                    key=f"dl_{mill}")
+                    except Exception as e:
+                        st.error(f"Sheet error: {e}")
+                        import traceback; st.code(traceback.format_exc())
+        else:
+            st.info("👆 Upload the WIP file in the Priority Scoring tab first.")
