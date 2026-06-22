@@ -45,7 +45,8 @@ with st.sidebar:
         ["📋 Generate Plan", "🧠 Learn from Corrections",
          "📊 Stats & Rules", "⚙️ Roll Optimiser",
          "🔩 Roll Life Tracker", "📐 Width Programme",
-         "🏭 Shift Execution", "🎯 Priority Advisor"],
+         "🏭 Shift Execution", "🎯 Priority Advisor",
+         "📓 Outcome Logger"],
         label_visibility="collapsed",
     )
 
@@ -1649,455 +1650,842 @@ elif page == "🎯 Priority Advisor":
                 step=5.0, key=f"dem_{_cname}")
 
     # ── Tabs ─────────────────────────────────────────────────────────
-    tab_priority, tab_crs, tab_forecast, tab_sheet = st.tabs(
-        ["🎯 Priority Scoring", "🔧 CRS Setting Optimiser",
-         "📉 Depletion Forecast", "📄 Rolling Sheet"])
+elif page == "🎯 Priority Advisor":
+    import pandas as pd
+    from priority_advisor import (
+        compute_priority, MODES, CONFIG,
+        forecast_depletion, build_rolling_sheet, optimise_crs_sequence,
+    )
+    from roll_campaign_planner import (
+        RollState, build_combined_plan, get_today_coil_shortlist,
+        ROLL_TYPES, DEFAULT_ROLL_LIFE, ROLL_CHANGE_MINUTES,
+    )
 
-    with tab_priority:
-     if wip_pa and st.button("🎯 Compute Priority", type="primary",
-                             use_container_width=True):
-        with st.spinner("Analysing plan and scoring sections…"):
+    st.title("🎯 Priority Advisor & Roll Campaign Planner")
+    st.caption(
+        "Upload today's WIP → configure rolls & capacity → one click gives "
+        "priority scores, depletion forecast, CRS sequence and roll campaign plan.")
+
+    # ══════════════════════════════════════════════════════════════
+    # INPUTS — all at the top, always visible
+    # ══════════════════════════════════════════════════════════════
+    with st.expander("⚙️ Configure — WIP, Mode, Rolls & Capacity",
+                     expanded=True):
+        wip_pa = st.file_uploader("Today's WIP file", type=["xlsx"],
+                                  key="wip_pa")
+
+        col_mode, col_shift = st.columns([3, 1])
+        with col_mode:
+            mode = st.selectbox("Planning mode",
+                list(MODES.keys()), format_func=lambda k: MODES[k])
+        with col_shift:
+            shift_no = st.selectbox("Shift", [1, 2, 3],
+                format_func=lambda x: {1:"Shift 1",
+                                       2:"Shift 2",3:"Shift 3"}[x])
+
+        st.markdown("**Current Rolls on Mills**")
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            st.caption("CRM-04")
+            roll_type_04 = st.selectbox("Roll type", ROLL_TYPES, key="rt04")
+            mt_rem_04    = st.number_input(
+                "MT remaining",
+                min_value=0.0,
+                max_value=float(DEFAULT_ROLL_LIFE.get(roll_type_04, 300)),
+                value=float(DEFAULT_ROLL_LIFE.get(roll_type_04, 300)) * 0.5,
+                step=10.0, key="mr04",
+                help=f"Full life = {DEFAULT_ROLL_LIFE.get(roll_type_04,300)} MT")
+            st.progress(
+                int(mt_rem_04 / DEFAULT_ROLL_LIFE.get(roll_type_04, 300) * 100),
+                text=f"{mt_rem_04 / DEFAULT_ROLL_LIFE.get(roll_type_04,300)*100:.0f}% life left")
+
+        with rc2:
+            st.caption("CRM-06")
+            roll_type_06 = st.selectbox(
+                "Roll type", ROLL_TYPES, key="rt06",
+                index=ROLL_TYPES.index("Light Matt") if "Light Matt" in ROLL_TYPES else 0)
+            mt_rem_06    = st.number_input(
+                "MT remaining",
+                min_value=0.0,
+                max_value=float(DEFAULT_ROLL_LIFE.get(roll_type_06, 300)),
+                value=float(DEFAULT_ROLL_LIFE.get(roll_type_06, 300)) * 0.5,
+                step=10.0, key="mr06")
+            st.progress(
+                int(mt_rem_06 / DEFAULT_ROLL_LIFE.get(roll_type_06, 300) * 100),
+                text=f"{mt_rem_06 / DEFAULT_ROLL_LIFE.get(roll_type_06,300)*100:.0f}% life left")
+
+        st.markdown("**Mill Daily Capacity (MT/day)**")
+        cc1, cc2 = st.columns(2)
+        cap04 = cc1.number_input("CRM-04", min_value=50.0, max_value=300.0,
+                                  value=165.0, step=5.0, key="cap04",
+                                  help="150–180 MT/day typical")
+        cap06 = cc2.number_input("CRM-06", min_value=50.0, max_value=300.0,
+                                  value=185.0, step=5.0, key="cap06",
+                                  help="170–200 MT/day typical")
+        st.caption(f"Combined: {cap04+cap06:.0f} MT/day  (typical 220–300)")
+
+        st.markdown("**Downstream Consumption Rates (MT/day)**")
+        cons_cols = st.columns(len(CONFIG["consumers"]))
+        cons_overrides = {}
+        for col, (cname, ccfg) in zip(cons_cols, CONFIG["consumers"].items()):
+            cons_overrides[cname] = col.number_input(
+                cname, value=float(ccfg["daily_mt"]),
+                step=5.0, key=f"dem_{cname}")
+
+    if not wip_pa:
+        st.info("👆 Upload today's WIP file above, then click **Run Analysis**.")
+        st.stop()
+
+    if st.button("🚀 Run Full Analysis", type="primary",
+                 use_container_width=True):
+        with st.spinner("Computing priority, coverage, campaigns and CRS sequence…"):
             try:
                 import tempfile, os as _os
-                from generator import load_wip, filter_rolling_coils, \
-                                       assign_all, build_sections
+                from generator import load_wip, filter_rolling_coils,                                        assign_all, build_sections
 
+                wip_pa.seek(0)
                 with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
-                    t.write(wip_pa.read()); wip_path = t.name
+                    t.write(wip_pa.read()); fp = t.name
 
-                import pandas as _rpd
-                raw_wip_df = _rpd.read_excel(wip_path)
-                df         = load_wip(wip_path)
-                eligible   = filter_rolling_coils(df)
-                assigned   = assign_all(eligible, load_db())
-                sections   = build_sections(assigned, load_db())
-                _os.unlink(wip_path)
+                raw_df  = pd.read_excel(fp)
+                wip_df  = load_wip(fp)
+                secs    = build_sections(
+                    assign_all(filter_rolling_coils(wip_df), load_db()),
+                    load_db())
+                _os.unlink(fp)
 
-                downstream_demand = _demand_vals
+                # Core computations
+                pr      = compute_priority(secs, wip_df=raw_df,
+                                           mode=mode, shift_no=shift_no,
+                                           downstream_demand=cons_overrides)
+                fc      = forecast_depletion(raw_df, secs, cons_overrides)
+                roll04  = RollState("CRM04", roll_type_04, mt_rem_04)
+                roll06  = RollState("CRM06", roll_type_06, mt_rem_06)
+                rp      = build_combined_plan(
+                    roll_crm04=roll04, roll_crm06=roll06,
+                    sections=secs,
+                    capacity_crm04=cap04, capacity_crm06=cap06,
+                    priority_result=pr)
+                crs     = optimise_crs_sequence(secs, urgency_aware=True,
+                                                coverage=pr.get("coverage"))
+                sheets  = build_rolling_sheet(secs, pr)
 
-                result = compute_priority(
-                    sections, wip_df=raw_wip_df, mode=mode,
-                    shift_no=shift_no,
-                    downstream_demand=downstream_demand)
-
-                kpis = result['kpis']
-
-                # ── Global warnings ───────────────────────────────
-                for w in result['warnings']:
+                # ── Global warnings first ─────────────────────────────
+                all_warnings = pr["warnings"] + rp["warnings"]
+                for w in all_warnings:
                     st.warning(w)
 
-                # ── KPI metrics ───────────────────────────────────
-                st.subheader("📊 Today's Plan — Downstream Feed")
-                k1, k2, k3, k4, k5 = st.columns(5)
-                STATUS_EMOJI = {"CRITICAL":"🔴","WARNING":"🟠",
-                                 "WATCH":"🟡","OK":"🟢"}
-                cov = result.get('coverage', {})
-                cov_items = list(cov.items())
-                cov_cols  = st.columns(len(cov_items))
-                for _cc, (_cn, _cv) in zip(cov_cols, cov_items):
-                    _cc.metric(
-                        f"{STATUS_EMOJI.get(_cv.status,'⚪')} {_cn}",
-                        f"{_cv.coverage_today:.1f}d cover",
-                        f"Buffer {_cv.ready_today_mt:.0f}MT",
+                # ══════════════════════════════════════════════════════
+                # SECTION A — CUSTOMER COVERAGE BOARD
+                # ══════════════════════════════════════════════════════
+                st.subheader("📊 A — Customer Demand Coverage")
+                SICON = {"CRITICAL":"🔴","WARNING":"🟠","WATCH":"🟡","OK":"🟢"}
+                cov_cols = st.columns(len(pr["coverage"]))
+                for col, (cname, cov) in zip(
+                        cov_cols,
+                        sorted(pr["coverage"].items(),
+                               key=lambda x: x[1].priority, reverse=True)):
+                    col.metric(
+                        f"{SICON[cov.status]} {cname}",
+                        f"{cov.coverage_today:.1f}d cover",
+                        f"Buffer {cov.ready_today_mt:.0f}MT "
+                        f"+ Plan {cov.incoming_today_mt:.0f}MT",
                         delta_color="off")
+                    if cov.required_today_mt > 0:
+                        col.caption(
+                            f"⚡ Need {cov.required_today_mt:.0f}MT "
+                            f"today for 3-day cover")
+
+                # 7-day projection chart
+                with st.expander("📉 7-Day Buffer Projection", expanded=False):
+                    proj_rows = []
+                    for cname, r in fc.items():
+                        for p in r["projection"]:
+                            proj_rows.append({"Day": p["date"],
+                                             "Consumer": cname,
+                                             "Buffer MT": p["buffer_mt"]})
+                    pivot = (pd.DataFrame(proj_rows)
+                             .pivot(index="Day", columns="Consumer",
+                                    values="Buffer MT"))
+                    st.line_chart(pivot)
+                    st.caption("Lines hitting zero = starvation date")
 
                 st.divider()
 
-                # ── Priority sequences ────────────────────────────
-                col04, col06 = st.columns(2)
+                # ══════════════════════════════════════════════════════
+                # SECTION B — ROLL CAMPAIGN PLAN (merged into priority)
+                # ══════════════════════════════════════════════════════
+                st.subheader("🔩 B — Roll Campaign Plan")
+                rm1, rm2, rm3, rm4 = st.columns(4)
+                rm1.metric("Total MT today", f"{rp['total_mt']} MT",
+                           f"of {cap04+cap06:.0f} MT capacity")
+                rm2.metric("Roll changes", rp["total_changes"],
+                           f"{rp['total_change_min']} min downtime",
+                           delta_color="inverse")
+                rm3.metric("CRM-04 utilisation",
+                           f"{rp['crm04'].utilisation_pct:.0f}%")
+                rm4.metric("CRM-06 utilisation",
+                           f"{rp['crm06'].utilisation_pct:.0f}%")
 
-                def _render_sequence(sections_list, mill_label):
-                    st.markdown(f"### 🏭 {mill_label} — Priority Sequence")
-                    for s in sections_list:
-                        score    = s.total_score
-                        color    = ("🔴" if score >= 75 else
-                                    "🟡" if score >= 50 else "🟢")
-                        with st.container():
-                            c1, c2, c3, c4 = st.columns([1, 4, 2, 2])
-                            c1.markdown(f"**#{s.rank_crm04 if s.mill == 'CRM04' else s.rank_crm06}**")
-                            c2.markdown(
-                                f"{color} **{s.section_key.replace('_',' ').title()}**  \n"
-                                f"<small>→ {s.consumer}</small>",
-                                unsafe_allow_html=True)
-                            c3.metric("MT", f"{s.total_mt:.1f}",
-                                      label_visibility="collapsed")
-                            c4.metric("Score", f"{score:.0f}/100",
-                                      label_visibility="collapsed")
+                col04r, col06r = st.columns(2)
+                for col, mill_key, plan_obj in [
+                        (col04r, "CRM-04", rp["crm04"]),
+                        (col06r, "CRM-06", rp["crm06"])]:
+                    with col:
+                        rs = plan_obj.current_roll
+                        st.markdown(f"#### 🏭 {mill_key}")
+                        life_pct = rs.pct_remaining
+                        st.progress(
+                            int(life_pct),
+                            text=f"{rs.roll_type} · {rs.mt_remaining:.0f}MT left · {life_pct:.0f}%")
+                        for i, camp in enumerate(plan_obj.campaigns, 1):
+                            if camp.preceded_by_change:
+                                st.markdown(
+                                    f"🔄 **Roll change → {camp.roll_type}** "
+                                    f"({camp.change_cost_min} min)")
+                            cst = SICON.get(camp.consumer_status, "⚪")
+                            lbl = (f"Campaign {i}: **{camp.roll_type}** — "
+                                   f"{camp.n_coils} coils · {camp.total_mt:.1f}MT")
+                            with st.expander(lbl, expanded=(i == 1)):
+                                if camp.primary_consumer:
+                                    st.caption(
+                                        f"{cst} Feeds **{camp.primary_consumer}** "
+                                        f"({camp.consumer_status}) · "
+                                        f"Priority score {camp.avg_priority_score:.0f}/100")
+                                camp_rows = [
+                                    {"Seq": j+1, "Coil": c["coil"],
+                                     "Section": c["section"],
+                                     "Width": c["width"], "Thick": c["thick"],
+                                     "RT": c["rt"], "MT": c["mt"],
+                                     "Customer": c["customer"],
+                                     "Age(d)": c["age"]}
+                                    for j, c in enumerate(camp.coils)]
+                                st.dataframe(pd.DataFrame(camp_rows),
+                                             use_container_width=True,
+                                             hide_index=True)
+                        if plan_obj.deferred_sections:
+                            st.info("⏭️ Deferred: " +
+                                    ", ".join(plan_obj.deferred_sections))
 
-                        # Score breakdown bar — 7 factors A-G
-                        score_df = pd.DataFrame({
-                            'Factor': ['A Starvation','B Customer','C Age',
-                                       'D Dispatch','E Pipeline',
-                                       'F Efficiency','G Setup'],
-                            'Score':  [s.A_starvation, s.B_customer, s.C_age,
-                                       s.D_dispatch, s.E_pipeline,
-                                       s.F_efficiency, s.G_setup],
-                        })
-                        st.progress(int(score), text=f"Overall: {score:.0f}/100")
-
-                        if s.warnings:
-                            for w in s.warnings:
-                                st.caption(w)
-
-                        with st.expander("Score breakdown", expanded=False):
-                            st.dataframe(score_df, use_container_width=True,
-                                         hide_index=True)
-                        st.divider()
-
-                with col04:
-                    _render_sequence(result['crm04_sequence'], "CRM-04")
-                with col06:
-                    _render_sequence(result['crm06_sequence'], "CRM-06")
-
-                # ── Shift briefing ────────────────────────────────
-                st.subheader("📱 Shift Briefing (WhatsApp-ready)")
-                st.code(result['briefing'], language="text")
-                st.download_button(
-                    "⬇️ Download briefing as .txt",
-                    data      = result['briefing'],
-                    file_name = f"shift_briefing_shift{shift_no}.txt",
-                    mime      = "text/plain",
-                    use_container_width=True,
-                )
-
-                # ── Mode comparison ───────────────────────────────
                 st.divider()
+
+                # ══════════════════════════════════════════════════════
+                # SECTION C — PRIORITY SCORES
+                # ══════════════════════════════════════════════════════
+                st.subheader("🎯 C — Section Priority Scores")
+                pc04, pc06 = st.columns(2)
+                for col, mill, seq in [
+                        (pc04, "CRM-04", pr["crm04_sequence"]),
+                        (pc06, "CRM-06", pr["crm06_sequence"])]:
+                    with col:
+                        st.markdown(f"#### {mill}")
+                        for s in seq:
+                            rank = s.rank_crm04 if mill == "CRM-04" else s.rank_crm06
+                            score = s.total_score
+                            icon  = ("🔴" if score >= 75 else
+                                     "🟡" if score >= 50 else "🟢")
+                            with st.expander(
+                                    f"#{rank} {icon} "
+                                    f"{s.section_key.replace('_',' ').title()} "
+                                    f"— {score:.0f}/100",
+                                    expanded=(rank == 1)):
+                                c1, c2 = st.columns(2)
+                                c1.metric("MT", f"{s.total_mt:.1f}")
+                                c2.metric("Consumer", s.consumer)
+                                st.progress(int(score),
+                                            text=f"Overall: {score:.0f}/100")
+                                score_df = pd.DataFrame({
+                                    "Factor": ["A Starvation","B Customer",
+                                               "C Age","D Dispatch",
+                                               "E Pipeline","F Efficiency",
+                                               "G Setup"],
+                                    "Score":  [s.A_starvation, s.B_customer,
+                                               s.C_age, s.D_dispatch,
+                                               s.E_pipeline, s.F_efficiency,
+                                               s.G_setup],
+                                })
+                                st.dataframe(score_df, use_container_width=True,
+                                             hide_index=True)
+                                if s.warnings:
+                                    for w in s.warnings:
+                                        st.caption(w)
+                                st.caption(s.explanation)
+
+                st.divider()
+
+                # ══════════════════════════════════════════════════════
+                # SECTION D — CRS SEQUENCE
+                # ══════════════════════════════════════════════════════
+                st.subheader("🔧 D — CRS Setting Change Optimiser")
+                if "error" in crs:
+                    st.info(crs["error"])
+                else:
+                    xm1, xm2, xm3, xm4 = st.columns(4)
+                    xm1.metric("CRS coils",      crs["total_coils"])
+                    xm2.metric("Total MT",        f"{crs['total_mt']} MT")
+                    xm3.metric("Changes (before)",crs["original_changes"])
+                    xm4.metric("Changes (after)", crs["optimised_changes"],
+                               delta=f"-{crs['changes_saved']}",
+                               delta_color="inverse"
+                               if crs["changes_saved"] > 0 else "off")
+                    for rec in crs["recommendations"]:
+                        st.success(rec) if rec.startswith("✅") else st.warning(rec)
+                    with st.expander("CRS sequence table", expanded=False):
+                        seq_rows = []
+                        for i, c in enumerate(crs["optimised_sequence"], 1):
+                            chg = next((e for e in crs["change_events"]
+                                        if e["position"] == i-1), None)
+                            seq_rows.append({
+                                "Pos":       i,
+                                "Coil":      c["coil_number"],
+                                "Width":     c["width"],
+                                "Thick":     c["thick"],
+                                "Product":   c["product"],
+                                "MT":        round(c["weight"], 3),
+                                "Customer":  c["customer"][:15],
+                                "⚠️ Change": " | ".join(chg["changes"]) if chg else "",
+                            })
+                        st.dataframe(pd.DataFrame(seq_rows),
+                                     use_container_width=True, hide_index=True)
+
+                st.divider()
+
+                # ══════════════════════════════════════════════════════
+                # SECTION E — ROLLING SHEETS
+                # ══════════════════════════════════════════════════════
+                st.subheader("📄 E — Ordered Rolling Sheets")
+                sh04, sh06 = st.columns(2)
+                for col, mill, items in [
+                        (sh04, "CRM-04", sheets["CRM04"]),
+                        (sh06, "CRM-06", sheets["CRM06"])]:
+                    with col:
+                        st.markdown(f"#### {mill}")
+                        csv_rows = []
+                        for item in items:
+                            if item["type"] == "header":
+                                st.markdown(
+                                    f"**⬛ P{item['priority']}: "
+                                    f"{item['section'].replace('_',' ').title()}** "
+                                    f"— {item['coil_count']}c · {item['total_mt']}MT")
+                                csv_rows.append({
+                                    "Seq":"","Coil": f"=== P{item['priority']}: "
+                                    f"{item['section']} ===",
+                                    "Width":"","Thick":"","RT":"",
+                                    "MT": item["total_mt"],
+                                    "Customer":"","Remark":""})
+                            else:
+                                csv_rows.append({
+                                    "Seq":      item["seq"],
+                                    "Coil":     item["coil"],
+                                    "Width":    item["width"],
+                                    "Thick":    item["thick"],
+                                    "RT":       item["rt"],
+                                    "MT":       item["weight"],  # key is weight in rolling sheet
+                                    "Customer": item["customer"],
+                                    "Remark":   item["remark"]})
+                        coil_rows = [r for r in csv_rows if r["Seq"] != ""]
+                        st.dataframe(pd.DataFrame(coil_rows),
+                                     use_container_width=True,
+                                     hide_index=True, height=300)
+                        st.download_button(
+                            f"⬇️ {mill} sheet (CSV)",
+                            data=pd.DataFrame(csv_rows).to_csv(index=False),
+                            file_name=f"rolling_sheet_{mill.replace('-','')}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key=f"dl_{mill}")
+
+                st.divider()
+
+                # ══════════════════════════════════════════════════════
+                # SECTION F — COMBINED SHIFT BRIEFING
+                # ══════════════════════════════════════════════════════
+                st.subheader("📱 F — Combined Shift Briefing")
+                combined_briefing = (
+                    pr["briefing"] + "\n\n" + rp["briefing"])
+                st.code(combined_briefing, language="text")
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.download_button(
+                    "⬇️ Full briefing (.txt)",
+                    data=combined_briefing,
+                    file_name=f"shift_briefing_shift{shift_no}.txt",
+                    mime="text/plain", key="dl_brief")
+
+                shortlist = get_today_coil_shortlist(rp)
+                all_rows = []
+                for mill_s, its in shortlist.items():
+                    for item in its:
+                        if item["type"] == "coil":
+                            all_rows.append({
+                                "Mill":mill_s,"Campaign":item["section"],
+                                "Seq":item["seq"],"Coil":item["coil"],
+                                "Width":item["width"],"Thick":item["thick"],
+                                "RT":item["rt"],"MT":item["mt"],
+                                "Customer":item["customer"],"Age(d)":item["age"]})
+                sc2.download_button(
+                    "⬇️ Coil shortlist (CSV)",
+                    data=pd.DataFrame(all_rows).to_csv(index=False),
+                    file_name="todays_coil_shortlist.csv",
+                    mime="text/csv", key="dl_shortlist")
+
+                if "optimised_sequence" in crs:
+                    crs_csv = pd.DataFrame([{
+                        "Pos":i+1,"Coil":c["coil_number"],
+                        "Width":c["width"],"Thick":c["thick"],
+                        "MT":round(c["weight"],3),"Customer":c["customer"]}
+                        for i,c in enumerate(crs["optimised_sequence"])])
+                    sc3.download_button(
+                        "⬇️ CRS sequence (CSV)",
+                        data=crs_csv.to_csv(index=False),
+                        file_name="crs_sequence.csv",
+                        mime="text/csv", key="dl_crs")
+
+                # Mode comparison
                 with st.expander("🔄 Compare all planning modes"):
-                    st.caption("Shows how scores change under each mode")
-                    comparison_rows = []
+                    comp_rows = []
                     for m in MODES:
-                        r = compute_priority(sections, mode=m,
-                                             shift_no=shift_no,
-                                             downstream_demand=downstream_demand)
-                        top04 = r['crm04_sequence'][0].section_key if r['crm04_sequence'] else '—'
-                        top06 = r['crm06_sequence'][0].section_key if r['crm06_sequence'] else '—'
-                        comparison_rows.append({
-                            'Mode':          MODES[m],
-                            'CRM04 #1':      top04.replace('_',' ').title(),
-                            'CRM06 #1':      top06.replace('_',' ').title(),
-                            'Direct MT':     r['kpis']['direct_mt'],
-                            'Anneal MT':     r['kpis']['anneal_mt'],
+                        r = compute_priority(secs, wip_df=raw_df,
+                                            mode=m, shift_no=shift_no,
+                                            downstream_demand=cons_overrides)
+                        t04 = r["crm04_sequence"][0] if r["crm04_sequence"] else None
+                        t06 = r["crm06_sequence"][0] if r["crm06_sequence"] else None
+                        comp_rows.append({
+                            "Mode":           MODES[m],
+                            "CRM04 #1":       t04.section_key.replace("_"," ").title() if t04 else "—",
+                            "CRM04 Score":    t04.total_score if t04 else 0,
+                            "CRM06 #1":       t06.section_key.replace("_"," ").title() if t06 else "—",
+                            "CRM06 Score":    t06.total_score if t06 else 0,
+                            "Direct MT":      r["kpis"]["direct_mt"],
+                            "Anneal MT":      r["kpis"]["anneal_mt"],
                         })
-                    st.dataframe(pd.DataFrame(comparison_rows),
+                    st.dataframe(pd.DataFrame(comp_rows),
                                  use_container_width=True, hide_index=True)
 
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Analysis error: {e}")
                 import traceback; st.code(traceback.format_exc())
 
-     elif not wip_pa:
-        st.info("👆 Upload today's WIP file to get priority recommendations.")
-        st.subheader("📖 Planning Modes Guide")
-        mode_guide = pd.DataFrame([
-            {"Mode": MODES[k], "Use when": desc}
-            for k, desc in {
-                "BALANCED":     "Normal day — no specific crisis",
-                "TUBE_URGENT":  "Tube Plant calling for material urgently",
-                "HT_URGENT":    "H&T Line is idle or running low",
-                "MAX_PROD":     "Management pressure for maximum MT today",
-                "CLEAR_BACKLOG":"Old coils piling up — TDC expiry risk",
-                "FEED_ANNEAL":  "Annealing furnace starved — feed it now for 72h return",
-            }.items()
-        ])
-        st.dataframe(mode_guide, use_container_width=True, hide_index=True)
 
-    with tab_crs:
-        st.subheader("🔧 CRS Setting Change Optimiser")
-        st.caption(
-            "Finds the coil sequence at CRS that minimises width/thickness "
-            "setting changes — reducing downtime and improving throughput."
-        )
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE — OUTCOME LOGGER
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "📓 Outcome Logger":
+    import pandas as pd
+    from outcome_logger import (save_outcome, load_outcomes,
+                                 delete_outcome, calibrate_from_outcomes)
+    from priority_advisor import CONFIG
 
-        if wip_pa:
-            if st.button("🔧 Optimise CRS Sequence", type="primary",
-                         use_container_width=True, key="crs_btn"):
-                with st.spinner("Finding optimal CRS sequence…"):
-                    try:
-                        import tempfile, os as _os
-                        from generator import load_wip, filter_rolling_coils,                                                assign_all, build_sections
-                        from priority_advisor import optimise_crs_sequence
+    st.title("📓 Daily Outcome Logger")
+    st.caption(
+        "Log what actually happened each day. After 5+ days this auto-calibrates "
+        "all assumed constants — consumption rates, roll life, change times — "
+        "replacing guesses with your measured reality.")
 
-                        # Re-read WIP (already uploaded above)
-                        wip_pa.seek(0)
-                        with tempfile.NamedTemporaryFile(suffix=".xlsx",
-                                                         delete=False) as t:
-                            t.write(wip_pa.read()); wip_path = t.name
+    tab_log, tab_history, tab_calibration = st.tabs(
+        ["📝 Log Today", "📅 History", "🔬 Calibration"])
 
-                        df2      = load_wip(wip_path)
-                        eligible = filter_rolling_coils(df2)
-                        assigned = assign_all(eligible, load_db())
-                        sections = build_sections(assigned, load_db())
-                        _os.unlink(wip_path)
+    # ── TAB 1: LOG TODAY ──────────────────────────────────────────────
+    with tab_log:
+        st.subheader("Log Today's Outcomes")
 
-                        crs = optimise_crs_sequence(sections)
+        with st.form("outcome_form"):
+            fc1, fc2, fc3 = st.columns(3)
+            log_date = fc1.date_input("Date", value=pd.Timestamp.now().date())
+            shift_no = fc2.selectbox("Shift",
+                [0, 1, 2, 3],
+                format_func=lambda x: {0:"Full day",1:"Shift 1",
+                                       2:"Shift 2",3:"Shift 3"}[x])
+            logged_by = fc3.text_input("Logged by", placeholder="Your name")
 
-                        if 'error' in crs:
-                            st.error(crs['error'])
-                        else:
-                            # ── Summary metrics ───────────────────────
-                            m1, m2, m3, m4 = st.columns(4)
-                            m1.metric("Total CRS coils", crs['total_coils'])
-                            m2.metric("Total MT",        f"{crs['total_mt']} MT")
-                            m3.metric("Changes (current)", crs['original_changes'])
-                            m4.metric("Changes (optimised)",
-                                      crs['optimised_changes'],
-                                      delta=f"-{crs['changes_saved']}",
-                                      delta_color="inverse"
-                                      if crs['changes_saved'] > 0 else "off")
+            st.markdown("---")
+            st.markdown("#### 🏭 Actual Rolling Output")
+            oc1, oc2 = st.columns(2)
+            crm04_mt = oc1.number_input("CRM-04 MT rolled",
+                min_value=0.0, max_value=500.0, value=0.0, step=1.0)
+            crm06_mt = oc2.number_input("CRM-06 MT rolled",
+                min_value=0.0, max_value=500.0, value=0.0, step=1.0)
 
-                            for r in crs['recommendations']:
-                                if r.startswith("✅"):
-                                    st.success(r)
-                                elif r.startswith("⚠️"):
-                                    st.warning(r)
-                                else:
-                                    st.info(r)
-
-                            st.divider()
-
-                            # ── Optimised sequence table ──────────────
-                            st.subheader("Optimised CRS Running Sequence")
-                            st.caption(
-                                "Run coils in this order at CRS for minimum "
-                                "setting changes. Green = no change from previous. "
-                                "Red = setting change required.")
-
-                            seq_rows = []
-                            for i, c in enumerate(crs['optimised_sequence'], 1):
-                                is_change = any(
-                                    e['position'] == i-1
-                                    for e in crs['change_events'])
-                                change_desc = ""
-                                for e in crs['change_events']:
-                                    if e['position'] == i-1:
-                                        change_desc = " | ".join(e['changes'])
-                                seq_rows.append({
-                                    "Pos":       i,
-                                    "Coil":      c['coil_number'],
-                                    "Width (mm)":c['width'],
-                                    "Thick (mm)":c['thick'],
-                                    "Product":   c['product'],
-                                    "Customer":  c['customer'][:15],
-                                    "MT":        round(c['weight'], 3),
-                                    "⚠️ Change": change_desc,
-                                })
-                            seq_df = pd.DataFrame(seq_rows)
-                            st.dataframe(seq_df, use_container_width=True,
-                                         hide_index=True)
-
-                            # ── Change events detail ──────────────────
-                            if crs['change_events']:
-                                st.divider()
-                                st.subheader(
-                                    f"Setting Change Events "
-                                    f"({len(crs['change_events'])} changes)")
-                                for e in crs['change_events']:
-                                    color = "🔴" if e['is_major'] else "🟡"
-                                    with st.expander(
-                                        f"{color} After position {e['position']}: "
-                                        f"{e['from_coil']} → {e['to_coil']}  "
-                                        f"(cost: {e['change_cost']:.1f})",
-                                            expanded=e['is_major']):
-                                        for ch in e['changes']:
-                                            st.write(f"• {ch}")
-
-                            # ── Download sequence ─────────────────────
-                            st.download_button(
-                                "⬇️ Download CRS sequence as CSV",
-                                data=seq_df.to_csv(index=False),
-                                file_name="crs_sequence.csv",
-                                mime="text/csv",
-                                use_container_width=True,
-                            )
-
-                    except Exception as e:
-                        st.error(f"CRS optimiser error: {e}")
-                        import traceback; st.code(traceback.format_exc())
-        else:
-            st.info("👆 Upload the WIP file in the Priority Scoring tab first.")
-
-            st.subheader("📖 What counts as a CRS setting change?")
-            st.markdown("""
-| Change type | Effort | Time lost |
-|---|---|---|
-| Width change > 2mm | Guide adjustment | ~5 min |
-| Thickness change > 0.05mm | Pressure/tension reset | ~8 min |
-| Product change C09 → C01 | Full setup change | ~15 min |
-| Customer change | Label/inspection change | ~2 min |
-
-**Key rule:** Group same-width coils together regardless of section.  
-Running 470mm Tube FH → 470mm Tube FH = 0 changes.  
-Running 470mm Tube FH → 433mm LG Bala = 1 width change.  
-Running 470mm Tube FH → 410mm Tube FH → 433mm LG Bala = 2 changes.  
-Optimal: 470mm → 433mm → 425mm → 410mm = 3 changes for 30 coils.
-            """)
-
-    # ── TAB 3: DEPLETION FORECAST ─────────────────────────────────────
-    with tab_forecast:
-        st.subheader("📉 Downstream Buffer Depletion Forecast")
-        st.caption(
-            "Predicts when H&T, CRS, SPM and Annealing will run out of "
-            "material based on current WIP buffers + today's plan output."
-        )
-
-        if wip_pa:
-            st.markdown("**Consumption rates (MT/day)** — adjust to actuals:")
+            st.markdown("#### 🔩 Roll Changes")
             rc1, rc2, rc3, rc4 = st.columns(4)
-            crs_rate = rc1.number_input("CRS",       value=110.0, step=5.0, key="dr_crs")
-            ht_rate  = rc2.number_input("H&T",       value=45.0,  step=5.0, key="dr_ht")
-            spm_rate = rc3.number_input("SPM",       value=60.0,  step=5.0, key="dr_spm")
-            ann_rate = rc4.number_input("Annealing", value=130.0, step=5.0, key="dr_ann")
+            c04_changes = rc1.number_input("CRM-04 changes",
+                min_value=0, max_value=10, value=0, step=1)
+            c04_time    = rc2.number_input("CRM-04 change time (min)",
+                min_value=0, max_value=300, value=0, step=5)
+            c06_changes = rc3.number_input("CRM-06 changes",
+                min_value=0, max_value=10, value=0, step=1)
+            c06_time    = rc4.number_input("CRM-06 change time (min)",
+                min_value=0, max_value=300, value=0, step=5)
 
-            if st.button("📉 Forecast Depletion", type="primary",
-                         use_container_width=True, key="fc_btn"):
-                with st.spinner("Analysing WIP buffers…"):
-                    try:
-                        import tempfile, os as _os, pandas as _pd
-                        from generator import load_wip, filter_rolling_coils, \
-                                               assign_all, build_sections
-                        from priority_advisor import forecast_depletion
+            st.markdown("#### 📦 Actual Consumption per Consumer (MT/day)")
+            st.caption("How much did each downstream consumer actually consume today?")
+            con_cols = st.columns(5)
+            crs_cons  = con_cols[0].number_input("CRS",       0.0, 500.0, 0.0, 5.0)
+            ht_cons   = con_cols[1].number_input("H&T Line",  0.0, 200.0, 0.0, 5.0)
+            spm_cons  = con_cols[2].number_input("Skin Pass", 0.0, 200.0, 0.0, 5.0)
+            ann_cons  = con_cols[3].number_input("Annealing", 0.0, 500.0, 0.0, 5.0)
+            tube_cons = con_cols[4].number_input("Tube Plant",0.0, 300.0, 0.0, 5.0)
 
-                        wip_pa.seek(0)
-                        with tempfile.NamedTemporaryFile(suffix=".xlsx",
-                                                          delete=False) as t:
-                            t.write(wip_pa.read()); fp = t.name
+            st.markdown("#### 🔴 Starvation Events")
+            st.caption("Did any consumer actually run out of material or slow down?")
+            st1, st2, st3, st4, st5 = st.columns(5)
+            crs_s  = st1.checkbox("CRS starved")
+            ht_s   = st2.checkbox("H&T starved")
+            spm_s  = st3.checkbox("SPM starved")
+            ann_s  = st4.checkbox("Annealing starved")
+            tube_s = st5.checkbox("Tube starved")
 
-                        raw_full = _pd.read_excel(fp)
-                        df3      = load_wip(fp)
-                        secs3    = build_sections(
-                            assign_all(filter_rolling_coils(df3), load_db()),
-                            load_db())
-                        _os.unlink(fp)
+            st.markdown("#### 🎯 Priority Recommendation Tracking")
+            rpa, rpb, rpc = st.columns(3)
+            mode_used   = rpa.selectbox(
+                "Mode recommended today",
+                ["BALANCED","TUBE_URGENT","HT_URGENT","CRS_URGENT",
+                 "MAX_PROD","CLEAR_BACKLOG","FEED_ANNEAL",
+                 "DISPATCH_RECOVERY","PIPELINE_PROTECTION","(not used)"])
+            rec_followed = rpb.checkbox(
+                "Shift followed the priority recommendation?")
+            rec_accurate = rpc.checkbox(
+                "Following it gave a good outcome?",
+                disabled=not rec_followed)
 
-                        fc = forecast_depletion(raw_full, secs3, consumption={
-                            'CRS': crs_rate, 'H&T': ht_rate,
-                            'SPM': spm_rate, 'Annealing': ann_rate})
+            st.markdown("#### 🔩 Roll State at End of Shift")
+            rs1, rs2 = st.columns(2)
+            from roll_campaign_planner import ROLL_TYPES
+            crm04_roll_type = rs1.selectbox("CRM-04 roll type used",
+                ROLL_TYPES, key="olog_rt04")
+            crm04_roll_mt   = rs1.number_input(
+                "CRM-04 MT on current roll", 0.0, 500.0, 0.0, 5.0)
+            crm06_roll_type = rs2.selectbox("CRM-06 roll type used",
+                ROLL_TYPES, key="olog_rt06",
+                index=ROLL_TYPES.index("Light Matt")
+                if "Light Matt" in ROLL_TYPES else 0)
+            crm06_roll_mt   = rs2.number_input(
+                "CRM-06 MT on current roll", 0.0, 500.0, 0.0, 5.0)
 
-                        STATUS_ICON = {'CRITICAL': '🔴', 'WARNING': '🟠',
-                                       'WATCH': '🟡', 'OK': '🟢'}
+            notes = st.text_area("Notes / observations",
+                placeholder="Any issues, surprises, or context for today...")
 
-                        cols = st.columns(len(fc))
-                        for col, (consumer, r) in zip(cols, fc.items()):
-                            with col:
-                                st.markdown(
-                                    f"### {STATUS_ICON[r['status']]} {consumer}")
-                                st.metric("Buffer now",
-                                          f"{r['buffer_mt']} MT",
-                                          f"{r['buffer_coils']} coils",
-                                          delta_color="off")
-                                st.metric("Days to empty",
-                                          f"{r['days_to_empty']} days",
-                                          r['empty_date'] or "beyond 7d",
-                                          delta_color="off")
-                                st.metric("+ Today's plan feeds",
-                                          f"{r['incoming_today_mt']} MT")
-                                if r['required_today_mt'] > 0:
-                                    st.warning(
-                                        f"Need **{r['required_today_mt']} MT** "
-                                        f"rolled today for 3-day cover")
-                                else:
-                                    st.success("3-day cover secured ✅")
+            submitted = st.form_submit_button(
+                "💾 Save Outcome", type="primary", use_container_width=True)
 
-                        # Projection chart
-                        st.divider()
-                        st.subheader("7-Day Buffer Projection")
-                        proj_rows = []
-                        for consumer, r in fc.items():
-                            for p in r['projection']:
-                                proj_rows.append({'Day': p['date'],
-                                                  'Consumer': consumer,
-                                                  'Buffer MT': p['buffer_mt']})
-                        proj_df = pd.DataFrame(proj_rows)
-                        pivot = proj_df.pivot(index='Day', columns='Consumer',
-                                              values='Buffer MT')
-                        st.line_chart(pivot)
-                        st.caption(
-                            "Assumes today's plan output lands in buffer on day 0, "
-                            "then drains at the set consumption rate. Lines hitting "
-                            "zero = stage starves on that date.")
+        if submitted:
+            outcome = {
+                "log_date":              str(log_date),
+                "shift_no":              shift_no,
+                "logged_by":             logged_by,
+                "crm04_mt_rolled":       crm04_mt,
+                "crm06_mt_rolled":       crm06_mt,
+                "total_mt_rolled":       round(crm04_mt + crm06_mt, 1),
+                "crm04_roll_changes":    c04_changes,
+                "crm04_change_min":      c04_time,
+                "crm06_roll_changes":    c06_changes,
+                "crm06_change_min":      c06_time,
+                "crs_consumed_mt":       crs_cons,
+                "ht_consumed_mt":        ht_cons,
+                "spm_consumed_mt":       spm_cons,
+                "anneal_consumed_mt":    ann_cons,
+                "tube_consumed_mt":      tube_cons,
+                "crs_starved":           crs_s,
+                "ht_starved":            ht_s,
+                "spm_starved":           spm_s,
+                "anneal_starved":        ann_s,
+                "tube_starved":          tube_s,
+                "mode_used":             mode_used,
+                "recommendation_followed": rec_followed,
+                "recommendation_accurate": rec_accurate,
+                "crm04_roll_type":       crm04_roll_type,
+                "crm04_roll_mt_used":    crm04_roll_mt,
+                "crm06_roll_type":       crm06_roll_type,
+                "crm06_roll_mt_used":    crm06_roll_mt,
+                "notes":                 notes,
+            }
+            ok = save_outcome(outcome)
+            if ok:
+                st.success(f"✅ Outcome saved for {log_date} Shift {shift_no}")
+            else:
+                st.error("Save failed — check Supabase connection")
 
-                    except Exception as e:
-                        st.error(f"Forecast error: {e}")
-                        import traceback; st.code(traceback.format_exc())
+    # ── TAB 2: HISTORY ────────────────────────────────────────────────
+    with tab_history:
+        st.subheader("Outcome History")
+        days_back = st.slider("Show last N days", 7, 90, 30)
+        df_hist = load_outcomes(days_back)
+
+        if df_hist.empty:
+            st.info("No outcomes logged yet. Start logging daily after each shift.")
+            st.markdown("""
+**What to log each day (takes ~5 minutes):**
+1. Actual MT rolled on CRM-04 and CRM-06
+2. Number of roll changes and actual time lost
+3. Approximate MT consumed by each downstream consumer
+4. Whether any consumer actually starved (yes/no)
+5. Whether you followed the priority recommendation
+
+**After 5 days** — the Calibration tab starts replacing guessed constants.
+**After 30 days** — the system is tuned to your actual operation.
+            """)
         else:
-            st.info("👆 Upload the WIP file in the Priority Scoring tab first.")
+            st.success(f"{len(df_hist)} records from the last {days_back} days")
 
-    # ── TAB 4: ROLLING SHEET ──────────────────────────────────────────
-    with tab_sheet:
-        st.subheader("📄 Ordered Rolling Sheet — Shop Floor Copy")
+            # Summary metrics
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            sm1.metric("Avg daily MT",
+                round(pd.to_numeric(df_hist.get("total_mt_rolled", 0),
+                      errors="coerce").mean(), 1))
+            sm2.metric("Avg roll changes/day",
+                round((pd.to_numeric(df_hist.get("crm04_roll_changes", 0),
+                       errors="coerce").fillna(0) +
+                       pd.to_numeric(df_hist.get("crm06_roll_changes", 0),
+                       errors="coerce").fillna(0)).mean(), 1))
+
+            STARVE_COLS = ["crs_starved","ht_starved","spm_starved",
+                           "anneal_starved","tube_starved"]
+            LABELS      = ["CRS","H&T","SPM","Ann","Tube"]
+            any_starved = sum(
+                df_hist[c].map(lambda x: x if isinstance(x,bool)
+                               else str(x).lower()=="true").sum()
+                for c in STARVE_COLS if c in df_hist.columns)
+            sm3.metric("Starvation events", int(any_starved),
+                       f"in {len(df_hist)} days",
+                       delta_color="inverse")
+
+            if "recommendation_followed" in df_hist.columns:
+                fol = df_hist["recommendation_followed"].map(
+                    lambda x: x if isinstance(x,bool)
+                    else str(x).lower()=="true")
+                sm4.metric("Recommendation followed",
+                           f"{fol.mean()*100:.0f}%")
+
+            st.divider()
+
+            # Consumption trend
+            st.markdown("#### Actual Consumption Rates (MT/day)")
+            cons_data = {}
+            for label, col in [("CRS","crs_consumed_mt"),
+                                ("H&T","ht_consumed_mt"),
+                                ("SPM","spm_consumed_mt"),
+                                ("Annealing","anneal_consumed_mt"),
+                                ("Tube","tube_consumed_mt")]:
+                if col in df_hist.columns:
+                    vals = pd.to_numeric(df_hist[col], errors="coerce")
+                    vals = vals[vals > 0]
+                    if len(vals) > 0:
+                        cons_data[label] = vals.values[::-1]
+
+            if cons_data:
+                dates = df_hist["log_date"].dt.strftime("%d/%m")[::-1]
+                cons_df = pd.DataFrame(cons_data,
+                    index=range(len(df_hist)))
+                st.line_chart(cons_df)
+                st.caption("Actual MT consumed per day by each downstream consumer")
+
+            # Starvation heatmap
+            st.markdown("#### Starvation Events")
+            starve_df = pd.DataFrame()
+            for label, col in zip(LABELS, STARVE_COLS):
+                if col in df_hist.columns:
+                    starve_df[label] = df_hist[col].map(
+                        lambda x: 1 if (x is True or
+                                        str(x).lower()=="true") else 0)
+            if not starve_df.empty:
+                starve_summary = starve_df.sum().reset_index()
+                starve_summary.columns = ["Consumer","Starvation Events"]
+                starve_summary["Frequency %"] = (
+                    starve_summary["Starvation Events"] /
+                    len(df_hist) * 100).round(1)
+                st.dataframe(starve_summary, use_container_width=True,
+                             hide_index=True)
+
+            # Raw log
+            with st.expander("Raw outcome log"):
+                display_cols = ["log_date","shift_no","total_mt_rolled",
+                    "crm04_mt_rolled","crm06_mt_rolled",
+                    "crs_consumed_mt","ht_consumed_mt",
+                    "crm04_roll_changes","crm06_roll_changes",
+                    "mode_used","recommendation_followed","notes"]
+                show_cols = [c for c in display_cols if c in df_hist.columns]
+                st.dataframe(df_hist[show_cols], use_container_width=True,
+                             hide_index=True)
+
+                # Delete option
+                del_date = st.text_input(
+                    "Delete record by date (YYYY-MM-DD)", key="del_date")
+                del_shift = st.number_input(
+                    "Shift", 0, 3, 0, key="del_shift")
+                if st.button("🗑️ Delete this record", key="del_btn"):
+                    if del_date:
+                        if delete_outcome(del_date, del_shift):
+                            st.success("Deleted")
+                            st.rerun()
+                        else:
+                            st.error("Delete failed")
+
+    # ── TAB 3: CALIBRATION ────────────────────────────────────────────
+    with tab_calibration:
+        st.subheader("🔬 Auto-Calibration from Outcomes")
         st.caption(
-            "Coil-by-coil rolling order per mill, grouped under priority "
-            "section headers. Download as CSV and print for the operators."
-        )
+            "Once you have ≥5 days logged, these measured values replace "
+            "the assumed constants in the Priority Advisor and Roll Planner.")
 
-        if wip_pa:
-            sheet_mode  = st.selectbox("Order sections by", list(MODES.keys()),
-                            format_func=lambda k: MODES[k], key="sheet_mode")
-            sheet_shift = st.selectbox("Shift", [1, 2, 3], key="sheet_shift")
+        df_cal = load_outcomes(90)
+        cal    = calibrate_from_outcomes(df_cal)
 
-            if st.button("📄 Build Rolling Sheet", type="primary",
-                         use_container_width=True, key="sheet_btn"):
-                with st.spinner("Building rolling sheet…"):
-                    try:
-                        import tempfile, os as _os
-                        from generator import load_wip, filter_rolling_coils, \
-                                               assign_all, build_sections
-                        from priority_advisor import (compute_priority,
-                                                       build_rolling_sheet)
-                        wip_pa.seek(0)
-                        with tempfile.NamedTemporaryFile(suffix=".xlsx",
-                                                          delete=False) as t:
-                            t.write(wip_pa.read()); fp = t.name
-                        df4   = load_wip(fp)
-                        secs4 = build_sections(
-                            assign_all(filter_rolling_coils(df4), load_db()),
-                            load_db())
-                        _os.unlink(fp)
+        if cal["status"] == "insufficient_data":
+            st.warning(cal["message"])
+            st.markdown("""
+**Currently assumed values (not yet measured):**
 
-                        pr4    = compute_priority(secs4, mode=sheet_mode,
-                                                  shift_no=sheet_shift)
-                        sheets = build_rolling_sheet(secs4, pr4)
+| Constant | Assumed value | Source |
+|---|---|---|
+| CRS daily consumption | 110 MT/day | Estimate |
+| H&T daily consumption | 45 MT/day | Estimate |
+| Skin Pass daily consumption | 60 MT/day | Estimate |
+| Annealing daily consumption | 130 MT/day | Estimate |
+| Tube Plant daily consumption | 80 MT/day | Estimate |
+| CRM-04 daily capacity | 150–180 MT | Known range |
+| CRM-06 daily capacity | 170–200 MT | Known range |
+| Roll change time | 45 min | Planner confirmed |
+| Bright roll life | 180 MT | Estimate |
+| Light Matt roll life | 300 MT | Estimate |
 
-                        col04, col06 = st.columns(2)
-                        for col, mill in [(col04, 'CRM04'), (col06, 'CRM06')]:
-                            with col:
-                                st.markdown(f"## 🏭 {mill}")
-                                csv_rows = []
-                                for item in sheets[mill]:
-                                    if item['type'] == 'header':
-                                        st.markdown(
-                                            f"#### ⬛ Priority {item['priority']} — "
-                                            f"{item['section'].replace('_',' ').title()}"
-                                            f"  \n<small>{item['coil_count']} coils · "
-                                            f"{item['total_mt']} MT</small>",
-                                            unsafe_allow_html=True)
-                                        csv_rows.append({
-                                            'Seq': '', 'Coil': f"=== P{item['priority']}: "
-                                            f"{item['section']} ===",
-                                            'Width': '', 'Thick': '', 'RT': '',
-                                            'MT': item['total_mt'],
-                                            'Customer': '', 'Remark': ''})
-                                    else:
-                                        csv_rows.append({
-                                            'Seq': item['seq'], 'Coil': item['coil'],
-                                            'Width': item['width'],
-                                            'Thick': item['thick'], 'RT': item['rt'],
-                                            'MT': item['weight'],
-                                            'Customer': item['customer'],
-                                            'Remark': item['remark']})
-                                sheet_df = pd.DataFrame(
-                                    [r for r in csv_rows if r['Seq'] != ''])
-                                st.dataframe(sheet_df, use_container_width=True,
-                                             hide_index=True, height=420)
-                                st.download_button(
-                                    f"⬇️ {mill} sheet (CSV)",
-                                    data=pd.DataFrame(csv_rows).to_csv(index=False),
-                                    file_name=f"rolling_sheet_{mill}.csv",
-                                    mime="text/csv",
-                                    use_container_width=True,
-                                    key=f"dl_{mill}")
-                    except Exception as e:
-                        st.error(f"Sheet error: {e}")
-                        import traceback; st.code(traceback.format_exc())
+Start logging daily outcomes. These will be measured and replaced automatically.
+            """)
         else:
-            st.info("👆 Upload the WIP file in the Priority Scoring tab first.")
+            st.success(
+                f"✅ Calibrated from **{cal['n_days']} days** of actual data")
+            calibrated = cal.get("calibrated", {})
+
+            # Consumption rates
+            st.markdown("#### Consumption Rates (MT/day)")
+            cons_rows = []
+            for consumer in ["CRS","H&T Line","Skin Pass","Annealing","Tube Plant"]:
+                key  = f"{consumer}_daily_mt"
+                assumed = CONFIG["consumers"].get(consumer, {}).get("daily_mt", "—")
+                if key in calibrated:
+                    c = calibrated[key]
+                    delta = round(c["recommended"] - assumed, 1) if isinstance(assumed, (int,float)) else None
+                    cons_rows.append({
+                        "Consumer":   consumer,
+                        "Assumed":    assumed,
+                        "Measured":   c["recommended"],
+                        "Range":      f"{c['p25']}–{c['p75']}",
+                        "n days":     c["n"],
+                        "Δ vs assumed": delta,
+                    })
+                else:
+                    cons_rows.append({
+                        "Consumer": consumer,
+                        "Assumed":  assumed,
+                        "Measured": "not yet",
+                        "Range":    "—",
+                        "n days":   0,
+                        "Δ vs assumed": "—",
+                    })
+            cons_cal_df = pd.DataFrame(cons_rows)
+            st.dataframe(cons_cal_df, use_container_width=True, hide_index=True)
+
+            # Apply button — updates CONFIG live
+            if st.button("✅ Apply measured consumption rates to Priority Advisor",
+                         use_container_width=True):
+                from priority_advisor import CONFIG as PA_CONFIG
+                applied = []
+                for consumer in ["CRS","H&T Line","Skin Pass",
+                                  "Annealing","Tube Plant"]:
+                    key = f"{consumer}_daily_mt"
+                    if key in calibrated:
+                        PA_CONFIG["consumers"][consumer]["daily_mt"] = \
+                            calibrated[key]["recommended"]
+                        applied.append(
+                            f"{consumer}: {calibrated[key]['recommended']} MT/day")
+                if applied:
+                    st.success("Applied: " + " | ".join(applied))
+
+            st.divider()
+
+            # Mill capacity
+            st.markdown("#### Mill Daily Capacity")
+            cap_rows = []
+            for mill, low_def, high_def in [
+                    ("CRM04", 150, 180), ("CRM06", 170, 200)]:
+                key = f"{mill}_daily_capacity"
+                if key in calibrated:
+                    c = calibrated[key]
+                    cap_rows.append({
+                        "Mill":           mill,
+                        "Assumed low":    low_def,
+                        "Assumed high":   high_def,
+                        "Measured avg":   c["mean"],
+                        "Measured P25":   c["p25"],
+                        "Measured P75":   c["p75"],
+                        "n days":         c["n"],
+                    })
+            if cap_rows:
+                st.dataframe(pd.DataFrame(cap_rows),
+                             use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # Roll change time
+            st.markdown("#### Roll Change Time")
+            chg_rows = []
+            for mill in ["CRM04", "CRM06"]:
+                key = f"{mill}_change_time_min"
+                if key in calibrated:
+                    c = calibrated[key]
+                    chg_rows.append({
+                        "Mill":          mill,
+                        "Assumed":       "45 min",
+                        "Measured avg":  f"{c['mean']} min",
+                        "Measured median": f"{c['median']} min",
+                        "n events":      c["n_events"],
+                        "Recommended":   f"{c['recommended']} min",
+                    })
+            if chg_rows:
+                st.dataframe(pd.DataFrame(chg_rows),
+                             use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # Starvation risk
+            st.markdown("#### Starvation Risk by Consumer")
+            starve_rows = []
+            for consumer in ["CRS","H&T Line","Skin Pass",
+                              "Annealing","Tube Plant"]:
+                key = f"{consumer}_starvation_pct"
+                if key in calibrated:
+                    c = calibrated[key]
+                    risk_color = {"HIGH":"🔴","MEDIUM":"🟠","LOW":"🟢"}
+                    starve_rows.append({
+                        "Consumer":    consumer,
+                        "Risk":        f"{risk_color.get(c['risk'],'⚪')} {c['risk']}",
+                        "Frequency":   f"{c['frequency_pct']}%",
+                        "Events":      c["n_events"],
+                        "Days logged": c["n_days"],
+                    })
+            if starve_rows:
+                st.dataframe(pd.DataFrame(starve_rows),
+                             use_container_width=True, hide_index=True)
+                st.caption(
+                    "HIGH risk (>30% of days) = priority advisor must always "
+                    "prioritise this consumer. Use these numbers to confirm "
+                    "whether the BALANCED mode is working.")
+
+            # Recommendation accuracy
+            rec_key = "recommendation_accuracy"
+            if rec_key in calibrated:
+                c = calibrated[rec_key]
+                st.divider()
+                st.markdown("#### Priority Recommendation Accuracy")
+                ra1, ra2, ra3 = st.columns(3)
+                ra1.metric("Days recommendation followed",
+                           f"{c['followed_pct']}%")
+                if c.get("accurate_when_followed_pct") is not None:
+                    ra2.metric("Accurate when followed",
+                               f"{c['accurate_when_followed_pct']}%")
+                ra3.metric("Days in dataset", c["n_days"])
+                if c.get("accurate_when_followed_pct", 0) and \
+                   c["accurate_when_followed_pct"] < 60:
+                    st.warning(
+                        "⚠️ Recommendation accuracy below 60% — "
+                        "the scoring weights need tuning. "
+                        "Consider switching to BALANCED mode and building "
+                        "more history before using specialised modes.")
