@@ -2081,6 +2081,13 @@ elif page == "📓 Outcome Logger":
         "all assumed constants — consumption rates, roll life, change times — "
         "replacing guesses with your measured reality.")
 
+    # Safe import — roll_campaign_planner may not exist on older deployments
+    try:
+        from roll_campaign_planner import ROLL_TYPES
+    except ImportError:
+        ROLL_TYPES = ["Light Matt", "Bright", "Super Bright",
+                      "Chrome Plated", "Heavy Matt"]
+
     tab_log, tab_history, tab_calibration = st.tabs(
         ["📝 Log Today", "📅 History", "🔬 Calibration"])
 
@@ -2149,7 +2156,6 @@ elif page == "📓 Outcome Logger":
 
             st.markdown("#### 🔩 Roll State at End of Shift")
             rs1, rs2 = st.columns(2)
-            from roll_campaign_planner import ROLL_TYPES
             crm04_roll_type = rs1.selectbox("CRM-04 roll type used",
                 ROLL_TYPES, key="olog_rt04")
             crm04_roll_mt   = rs1.number_input(
