@@ -1640,28 +1640,15 @@ elif page == "🎯 Priority Advisor":
                                    2:"Shift 2 (14-22h)",
                                    3:"Shift 3 (22-06h)"}[x])
     with col3:
-        st.markdown("**Downstream demand level**")
-        st.caption("Set to HIGH if that stage is currently starved")
-        tube_demand = st.select_slider("Tube Plant (via CRS)",
-            options=[0.5, 1.0, 1.5, 2.0], value=1.0,
-            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
-                                   1.5:"Tight",2.0:"Starved"}[x],
-            help="Tube FH → CRS → Tube Plant")
-        ht_demand   = st.select_slider("H&T Line (direct)",
-            options=[0.5, 1.0, 1.5, 2.0], value=1.5,
-            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
-                                   1.5:"Tight",2.0:"Starved"}[x],
-            help="H&T Finish → directly to H&T Line, no CRS")
-        spm_demand  = st.select_slider("Skin Pass (direct)",
-            options=[0.5, 1.0, 1.5, 2.0], value=1.0,
-            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
-                                   1.5:"Tight",2.0:"Starved"}[x],
-            help="Skin Pass sections → directly to SPM, no CRS")
-        crs_demand  = st.select_slider("CRS (OEM/LG Bala)",
-            options=[0.5, 1.0, 1.5, 2.0], value=1.0,
-            format_func=lambda x: {0.5:"Surplus",1.0:"Normal",
-                                   1.5:"Tight",2.0:"Starved"}[x],
-            help="CRCA Finish → CRS → OEM or LG Bala dispatch")
+        from priority_advisor import CONFIG as _PA_CFG
+        st.markdown("**Daily consumption rates (MT/day)** — adjust to actuals:")
+        _demand_cols = st.columns(len(_PA_CFG['consumers']))
+        _demand_vals = {}
+        for _col, (_cname, _ccfg) in zip(
+                _demand_cols, _PA_CFG['consumers'].items()):
+            _demand_vals[_cname] = _col.number_input(
+                _cname, value=float(_ccfg['daily_mt']),
+                step=5.0, key=f"dem_{_cname}")
 
     # ── Tabs ─────────────────────────────────────────────────────────
     tab_priority, tab_crs, tab_forecast, tab_sheet = st.tabs(
@@ -1680,22 +1667,19 @@ elif page == "🎯 Priority Advisor":
                 with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
                     t.write(wip_pa.read()); wip_path = t.name
 
-                df       = load_wip(wip_path)
-                eligible = filter_rolling_coils(df)
-                assigned = assign_all(eligible, load_db())
-                sections = build_sections(assigned, load_db())
+                import pandas as _rpd
+                raw_wip_df = _rpd.read_excel(wip_path)
+                df         = load_wip(wip_path)
+                eligible   = filter_rolling_coils(df)
+                assigned   = assign_all(eligible, load_db())
+                sections   = build_sections(assigned, load_db())
                 _os.unlink(wip_path)
 
-                downstream_demand = {
-                    'CRS → Tube Plant':   tube_demand,
-                    'H&T Line (direct)':  ht_demand,
-                    'Skin Pass (direct)': spm_demand,
-                    'CRS → OEM/Dispatch': crs_demand,
-                    'CRS → LG Bala':      crs_demand,
-                }
+                downstream_demand = _demand_vals
 
                 result = compute_priority(
-                    sections, mode=mode, shift_no=shift_no,
+                    sections, wip_df=raw_wip_df, mode=mode,
+                    shift_no=shift_no,
                     downstream_demand=downstream_demand)
 
                 kpis = result['kpis']
@@ -1707,25 +1691,17 @@ elif page == "🎯 Priority Advisor":
                 # ── KPI metrics ───────────────────────────────────
                 st.subheader("📊 Today's Plan — Downstream Feed")
                 k1, k2, k3, k4, k5 = st.columns(5)
-                k1.metric("Via CRS → Tube Plant",
-                          f"{kpis['tube_mt']} MT",
-                          delta="urgent" if tube_demand >= 1.5 else None,
-                          delta_color="inverse",
-                          help="Tube FH → CRS → Tube Plant")
-                k2.metric("CRS total load",
-                          f"{kpis['crs_direct_mt']} MT",
-                          help="All material passing through CRS today")
-                k3.metric("H&T Line (direct)",
-                          f"{kpis['ht_mt']} MT",
-                          delta="starved" if ht_demand >= 1.5 else None,
-                          delta_color="inverse",
-                          help="H&T Finish → H&T Line directly, no CRS")
-                k4.metric("Skin Pass (direct)",
-                          f"{kpis['spm_mt']} MT",
-                          help="Skin Pass → SPM directly, no CRS")
-                k5.metric("→ Annealing (72h return)",
-                          f"{kpis['anneal_mt']} MT",
-                          help="Returns from annealing in ~72h")
+                STATUS_EMOJI = {"CRITICAL":"🔴","WARNING":"🟠",
+                                 "WATCH":"🟡","OK":"🟢"}
+                cov = result.get('coverage', {})
+                cov_items = list(cov.items())
+                cov_cols  = st.columns(len(cov_items))
+                for _cc, (_cn, _cv) in zip(cov_cols, cov_items):
+                    _cc.metric(
+                        f"{STATUS_EMOJI.get(_cv.status,'⚪')} {_cn}",
+                        f"{_cv.coverage_today:.1f}d cover",
+                        f"Buffer {_cv.ready_today_mt:.0f}MT",
+                        delta_color="off")
 
                 st.divider()
 
