@@ -22,6 +22,47 @@ from learner   import learn as learner_learn, calculate_accuracy
 from db        import load_db, save_db, is_supabase_connected, get_storage_mode
 from constants import SECTION_SHORT_NAME
 
+# ── New pipeline-aware planning engine ────────────────────────────────────
+from crm import config as C
+from crm import pipeline as PIPE
+from crm import health   as HLTH
+from crm import scoring  as SCORE
+from crm import campaign as CAMP
+from crm import twin     as TWIN
+from crm import planner  as PLAN
+
+
+# ── Shared WIP uploader — one upload serves every page ────────────────────
+def wip_gate(key: str = "wip_global"):
+    """Ensure a WIP file is loaded. Returns (tmp_path, enriched_df) or stops."""
+    import tempfile as _tf, os as _os
+    if st.session_state.get("wip_path") and st.session_state.get("wip_df") is not None:
+        with st.expander("📂 WIP file loaded — upload a different one?"):
+            up = st.file_uploader("Replace WIP", type=["xlsx"], key=key + "_r")
+            if up:
+                up.seek(0)
+                with _tf.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
+                    t.write(up.read()); p = t.name
+                st.session_state.wip_path = p
+                st.session_state.wip_df   = PIPE.load_pipeline(p)
+                st.session_state.pop("plan_result", None)
+                st.rerun()
+        return st.session_state.wip_path, st.session_state.wip_df
+
+    st.info("👋 Upload today's WIP file to begin.")
+    up = st.file_uploader("WIP file (.xlsx)", type=["xlsx"], key=key)
+    if not up:
+        st.stop()
+    up.seek(0)
+    with _tf.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
+        t.write(up.read()); p = t.name
+    st.session_state.wip_path = p
+    st.session_state.wip_df   = PIPE.load_pipeline(p)
+    st.rerun()
+
+
+HICON = {"CRITICAL": "🔴", "ATTENTION": "🟡", "HEALTHY": "🟢", "EXCESS": "🟠"}
+
 # ──────────────────────────────────────────────────────────────────────────
 # Page config
 # ──────────────────────────────────────────────────────────────────────────
@@ -42,8 +83,9 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["📋 Generate Plan", "🧠 Learn",
-         "🎯 Priority Advisor", "📊 Stats"],
+        ["🏭 Pipeline Overview", "🩺 Stage Health",
+         "🎯 Plan Builder", "🔮 Digital Twin",
+         "🧠 Learn", "📊 Stats"],
         label_visibility="collapsed",
     )
 
@@ -86,7 +128,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE 1 — GENERATE
 # ══════════════════════════════════════════════════════════════════════════
-if page == "📋 Generate Plan":
+if page == "__LEGACY_GENERATE__":
     st.title("📋 Generate Mill Plan")
     st.caption("Upload the daily WIP coil staging export → get a formatted rolling plan.")
 
@@ -566,476 +608,455 @@ elif page == "📊 Stats":
                         f"Priority Advisor setup.")
 
 
-elif page == "🎯 Priority Advisor":
-    import io as _io, pandas as pd
-    from datetime import date as _date
-    from priority_advisor import (
-        MODES, CONFIG, ROLL_TYPES, get_roll_life,
-        build_coverage, score_sections, build_roll_campaigns,
-        build_alternate_order, optimise_crs, forecast_depletion,
-    )
 
-    st.title("🎯 Priority Advisor")
-    st.caption("Plan your shift: select sections to run, get roll campaign "
-               "sequence, check consumer coverage, download rolling sheet.")
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE — 🏭 PIPELINE OVERVIEW   (Guideline §1, §3, §9)
+# ══════════════════════════════════════════════════════════════════════════════
+if page == "🏭 Pipeline Overview":
+    import pandas as pd
+    st.title("🏭 Pipeline Overview")
+    st.caption("Stage-wise WIP with Tube / OEM / H&T drill-down · "
+               "material flow · inventory aging")
 
-    SICON = {"CRITICAL":"🔴","WARNING":"🟠","WATCH":"🟡","OK":"🟢"}
+    _, df = wip_gate("wip_pipe")
 
-    # ── Session state ─────────────────────────────────────────────────────
-    for k, v in [("pa_sections", None), ("pa_raw", None),
-                 ("pa_result", None), ("pa_selected", {}),
-                 ("pa_rolled", set())]:
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-    # ══════════════════════════════════════════════════════════════════════
-    # STEP 1 — SETUP
-    # ══════════════════════════════════════════════════════════════════════
-    with st.expander("⚙️ Step 1 — Setup",
-                     expanded=st.session_state.pa_sections is None):
-        wip_file = st.file_uploader("Today's WIP file", type=["xlsx"],
-                                    key="pa_wip")
-
-        sc1, sc2, sc3 = st.columns(3)
-        mode     = sc1.selectbox("Planning mode", list(MODES.keys()),
-                                 format_func=lambda k: MODES[k])
-        shift_no = sc2.selectbox("Shift", [1,2,3],
-                                 format_func=lambda x: f"Shift {x}")
-        st.markdown("**Current rolls on mills**")
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            st.caption("CRM-04")
-            rt04  = st.selectbox("Roll type", ROLL_TYPES, key="rt04")
-            mu04  = st.number_input("MT already rolled on this roll",
-                                    0.0, 500.0, 0.0, 5.0, key="mu04")
-        with rc2:
-            st.caption("CRM-06")
-            idx06 = ROLL_TYPES.index("Light Matt")
-            rt06  = st.selectbox("Roll type", ROLL_TYPES, key="rt06",
-                                 index=idx06)
-            mu06  = st.number_input("MT already rolled on this roll",
-                                    0.0, 500.0, 0.0, 5.0, key="mu06")
-
-        # Show roll life remaining
-        _cr1, _cr2 = st.columns(2)
-        _life04 = get_roll_life(rt04, "HT_FINISH" if rt04=="Bright"
-                                else "RE_ROLLING")
-        _life06 = get_roll_life(rt06, "FIRST_ROLLING")
-        _rem04  = max(0, _life04 - mu04)
-        _rem06  = max(0, _life06 - mu06)
-        _cr1.progress(int(_rem04/_life04*100) if _life04 else 0,
-                      text=f"CRM-04 {rt04}: {_rem04:.0f}MT remaining ({_life04}MT life)")
-        _cr2.progress(int(_rem06/_life06*100) if _life06 else 0,
-                      text=f"CRM-06 {rt06}: {_rem06:.0f}MT remaining ({_life06}MT life)")
-
-        st.markdown("**Consumption overrides (MT/day)** — leave as-is if no change")
-        _cc1, _cc2, _cc3 = st.columns(3)
-        cons_ovr = {
-            "H&T Line":   _cc1.number_input("H&T Line", 0.0, 200.0,
-                float(CONFIG["consumers"]["H&T Line"]["daily_mt"]), 5.0),
-            "Tube Plant": _cc2.number_input("Tube Plant", 0.0, 500.0,
-                float(CONFIG["consumers"]["Tube Plant"]["daily_mt"]), 5.0),
-            "OEM":        _cc3.number_input("OEM", 0.0, 300.0,
-                float(CONFIG["consumers"]["OEM"]["daily_mt"]), 5.0),
-        }
-
-        run_btn = st.button("🚀 Load WIP & Score Sections",
-                            type="primary", use_container_width=True,
-                            disabled=wip_file is None)
-
-    if run_btn and wip_file:
-        with st.spinner("Loading WIP and scoring sections…"):
-            try:
-                import tempfile, os as _os
-                from generator import load_wip, filter_rolling_coils,                                        assign_all, build_sections
-                wip_file.seek(0)
-                with tempfile.NamedTemporaryFile(suffix=".xlsx",
-                                                  delete=False) as t:
-                    t.write(wip_file.read()); fp = t.name
-                raw_df = pd.read_excel(fp)
-                wip_df = load_wip(fp)
-                secs   = build_sections(
-                    assign_all(filter_rolling_coils(wip_df), load_db()),
-                    load_db())
-                _os.unlink(fp)
-                coverage = build_coverage(raw_df, cons_ovr)
-                scored   = score_sections(secs, coverage, mode,
-                                          {"CRM04": rt04, "CRM06": rt06})
-                st.session_state.pa_sections  = secs
-                st.session_state.pa_raw       = raw_df
-                st.session_state.pa_result    = scored
-                st.session_state.pa_coverage  = coverage
-                st.session_state.pa_mode      = mode
-                st.session_state.pa_shift     = shift_no
-                st.session_state.pa_rt04      = rt04
-                st.session_state.pa_rt06      = rt06
-                st.session_state.pa_mu04      = mu04
-                st.session_state.pa_mu06      = mu06
-                st.session_state.pa_cons_ovr  = cons_ovr
-                st.session_state.pa_selected  = {
-                    s.section_key: True for s in scored}
-                st.session_state.pa_rolled    = set()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
-                import traceback; st.code(traceback.format_exc())
-
-    if st.session_state.pa_sections is None:
-        st.info("👆 Upload WIP file and click **Load WIP & Score Sections**.")
-        st.stop()
-
-    # Restore state
-    scored    = st.session_state.pa_result
-    coverage  = st.session_state.pa_coverage
-    secs      = st.session_state.pa_sections
-    raw_df    = st.session_state.pa_raw
-    mode      = st.session_state.get("pa_mode", "H&T_PRIORITY")
-    rt04      = st.session_state.get("pa_rt04", "Bright")
-    rt06      = st.session_state.get("pa_rt06", "Light Matt")
-    mu04      = st.session_state.get("pa_mu04", 0.0)
-    mu06      = st.session_state.get("pa_mu06", 0.0)
-    cons_ovr  = st.session_state.get("pa_cons_ovr", {})
-    rolled    = st.session_state.pa_rolled
-
-    # Live mode change without re-upload
-    new_mode = st.selectbox("🔄 Change mode (live re-score)",
-        list(MODES.keys()), format_func=lambda k: MODES[k],
-        index=list(MODES.keys()).index(mode),
-        key="pa_live_mode")
-    if new_mode != mode:
-        cov2   = build_coverage(raw_df, cons_ovr)
-        scored = score_sections(secs, cov2, new_mode,
-                                {"CRM04": rt04, "CRM06": rt06})
-        st.session_state.pa_result   = scored
-        st.session_state.pa_mode     = new_mode
-        st.session_state.pa_coverage = cov2
-        coverage = cov2
-        mode     = new_mode
-
-    # ══════════════════════════════════════════════════════════════════════
-    # A — CONSUMER COVERAGE
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("📊 A — Consumer Coverage")
-    cov_cols = st.columns(3)
-    for col, (cname, cov) in zip(
-            cov_cols,
-            sorted(coverage.items(), key=lambda x: -x[1].daily_mt)):
-        col.metric(f"{SICON[cov.status]} {cname}",
-                   f"{cov.coverage_days:.1f}d cover",
-                   f"Buffer {cov.buffer_mt:.0f}MT | Ask {cov.daily_mt:.0f}MT/day",
-                   delta_color="off")
-        if cov.shortfall_mt > 0:
-            col.caption(f"⚡ Need {cov.shortfall_mt:.0f}MT to reach target")
-    for cname, cov in coverage.items():
-        if cov.status == "CRITICAL":
-            st.error(f"🔴 {cname} CRITICAL — only {cov.coverage_days:.1f}d cover")
-        elif cov.status == "WARNING":
-            st.warning(f"🟠 {cname} WARNING — {cov.coverage_days:.1f}d cover")
+    # ── Headline ──────────────────────────────────────────────────────────
+    m = st.columns(4)
+    m[0].metric("Total WIP", f"{df['mt'].sum():,.0f} MT", f"{len(df)} coils")
+    for i, cons in enumerate(("TUBE", "OEM", "H&T"), start=1):
+        d = df[df["consumer"] == cons]
+        cfg = C.CONSUMERS[cons]
+        m[i].metric(f"{cfg['icon']} {cfg['label']}",
+                    f"{d['mt'].sum():,.0f} MT",
+                    f"{len(d)} coils · ask {cfg['daily_mt']:.0f} MT/day")
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════════════════
-    # B — SELECT SECTIONS FOR TODAY
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("☑️ B — Select Sections to Run Today")
-    st.caption("Tick sections you plan to run. System will sequence them "
-               "per mill with minimum roll changes.")
+    # ── §1 Stage-wise breakup ─────────────────────────────────────────────
+    st.subheader("📊 Stage-wise WIP Breakup")
+    all_stages = st.toggle("Show all stages", value=False)
+    stages = None if all_stages else C.CORE_STAGES
+    sb = PIPE.stage_breakup(df, stages)
+    st.dataframe(
+        sb.style.background_gradient(cmap="Blues", subset=["TOTAL"])
+                .format(precision=1),
+        use_container_width=True)
+    st.bar_chart(sb[["TUBE", "OEM", "H&T"]])
 
-    selected_keys = set()
-    for mill in ("CRM04", "CRM06"):
-        mill_scored = sorted([s for s in scored if s.mill == mill],
-                             key=lambda x: x.priority_rank)
-        if not mill_scored:
-            continue
-        st.markdown(f"**🏭 {mill}**")
-        cap_type_map = {"first_rolling": "first_rolling",
-                        "re_rolling": "re_rolling", "finishing": "finishing",
-                        "rolling": "re_rolling"}
-        for s in mill_scored:
-            cap_type = ("first_rolling" if s.section_key == "FIRST_ROLLING"
-                        else "re_rolling" if s.section_key in
-                             ("RE_ROLLING","ROLLING")
-                        else "finishing")
-            shift_cap = CONFIG["shift_capacity"][mill].get(cap_type, 80)
-            age_flag  = (f" 🔴 oldest={s.coils_df['Coil Age(# Days)'].max():.0f}d"
-                         if hasattr(s.coils_df,'iterrows') and
-                            float(s.coils_df["Coil Age(# Days)"].max()) > 14
-                         else "")
-            checked = st.session_state.pa_selected.get(s.section_key, True)
-            col_cb, col_info = st.columns([1, 8])
-            new_val = col_cb.checkbox("", value=checked,
-                                      key=f"sel_{mill}_{s.section_key}")
-            st.session_state.pa_selected[s.section_key] = new_val
-            col_info.markdown(
-                f"**P{s.priority_rank}. {s.section_key.replace('_',' ').title()}**"
-                f" [{s.roll_type}] · {s.n_coils}c · {s.total_mt:.1f}MT"
-                f" · {SICON[coverage.get(s.consumer, type('x',(),{'status':'OK'})()).status] if hasattr(coverage.get(s.consumer, None),'status') else '⚪'} {s.consumer}"
-                f"{age_flag}  `shift cap {shift_cap}MT`")
-            if new_val:
-                selected_keys.add(s.section_key)
-
-    selected_sections = [s for s in scored
-                         if s.section_key in selected_keys]
-    if not selected_sections:
-        st.warning("No sections selected. Tick at least one above.")
-        st.stop()
-
-    st.divider()
-
-    # ══════════════════════════════════════════════════════════════════════
-    # C — ROLL CAMPAIGN PLAN
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("🔩 C — Roll Campaign Plan")
-
-    def _shift_cap(mill: str, sections: List) -> float:
-        """Estimate shift capacity based on mix of selected sections."""
-        types = {"first_rolling":0,"re_rolling":0,"finishing":0}
-        for s in sections:
-            if s.mill != mill: continue
-            if s.section_key == "FIRST_ROLLING":
-                types["first_rolling"] += s.total_mt
-            elif s.section_key in ("RE_ROLLING","ROLLING"):
-                types["re_rolling"] += s.total_mt
-            else:
-                types["finishing"] += s.total_mt
-        tot = sum(types.values()) or 1
-        cap = CONFIG["shift_capacity"][mill]
-        return (types["first_rolling"]/tot * cap["first_rolling"] +
-                types["re_rolling"]  /tot * cap["re_rolling"] +
-                types["finishing"]   /tot * cap["finishing"])
-
-    plan_compare_rows = []
-    camp_data = {}
-
-    for mill, cur_roll, mt_used in [
-            ("CRM04", rt04, mu04), ("CRM06", rt06, mu06)]:
-        mill_secs_prio = sorted(
-            [s for s in selected_sections if s.mill == mill],
-            key=lambda x: x.priority_rank)
-        mill_secs_alt  = build_alternate_order(
-            selected_sections, cur_roll, mill)
-        sh_cap = _shift_cap(mill, selected_sections)
-
-        camps_prio, defer_prio, nc_prio, dt_prio = build_roll_campaigns(
-            mill_secs_prio, cur_roll, mt_used, mill, sh_cap)
-        camps_alt, defer_alt, nc_alt, dt_alt = build_roll_campaigns(
-            mill_secs_alt, cur_roll, mt_used, mill, sh_cap)
-
-        camp_data[mill] = {
-            "prio": camps_prio, "alt": camps_alt,
-            "defer_prio": defer_prio, "defer_alt": defer_alt,
-            "nc_prio": nc_prio, "nc_alt": nc_alt,
-            "dt_prio": dt_prio, "dt_alt": dt_alt,
-            "sh_cap": sh_cap, "cur_roll": cur_roll, "mt_used": mt_used,
-        }
-        plan_compare_rows.append({
-            "Mill": mill,
-            "Plan": "Priority",
-            "Roll changes": nc_prio,
-            "Downtime (min)": dt_prio,
-            "MT planned": round(sum(c.total_mt for c in camps_prio), 1),
-        })
-        plan_compare_rows.append({
-            "Mill": mill,
-            "Plan": "Alternate (min changes)",
-            "Roll changes": nc_alt,
-            "Downtime (min)": dt_alt,
-            "MT planned": round(sum(c.total_mt for c in camps_alt), 1),
-        })
-
-    # Comparison table
-    st.markdown("#### Plan Comparison — Priority vs Alternate")
-    st.dataframe(pd.DataFrame(plan_compare_rows),
-                 use_container_width=True, hide_index=True)
-
-    # Per-mill plan choice
-    plan_choice = {}
-    for mill in ("CRM04", "CRM06"):
-        d = camp_data[mill]
-        savings = d["dt_prio"] - d["dt_alt"]
-        if savings > 0:
-            choices = [
-                f"⚡ Priority Plan — {d['nc_prio']} change(s), {d['dt_prio']} min downtime",
-                f"🔩 Alternate Plan — {d['nc_alt']} change(s), {d['dt_alt']} min downtime, saves {savings} min",
-            ]
-            choice = st.radio(f"**{mill} — which sequence?**", choices,
-                              key=f"choice_{mill}", index=0)
-            plan_choice[mill] = "alt" if "Alternate" in choice else "prio"
-        else:
-            st.success(f"✅ {mill}: Priority order already minimises roll changes "
-                       f"({d['nc_prio']} change(s))")
-            plan_choice[mill] = "prio"
-
-    # Show chosen campaigns per mill
-    for mill in ("CRM04", "CRM06"):
-        d       = camp_data[mill]
-        use_key = plan_choice.get(mill, "prio")
-        camps   = d[use_key]
-        defer   = d[f"defer_{use_key}"]
-        st.markdown(f"**🏭 {mill} — {'Priority' if use_key=='prio' else 'Alternate'} Plan**")
-        for i, camp in enumerate(camps, 1):
-            if camp.preceded_by_change:
-                st.markdown(
-                    f"🔄 **ROLL CHANGE: {camp.change_from} → {camp.roll_type}** "
-                    f"({CONFIG['roll_change_min']} min)")
-            life_used_pct = int(camp.mt_used_end / camp.roll_life * 100
-                                ) if camp.roll_life else 0
-            warn = " ⚠️ Exceeds roll life!" if camp.exceeds_life else ""
-            with st.expander(
-                    f"Campaign {i}: {camp.roll_type} — "
-                    f"{camp.n_coils} coils · {camp.total_mt:.1f}MT{warn}",
-                    expanded=(i == 1)):
-                st.progress(min(life_used_pct, 100),
-                            text=f"Roll life: {camp.mt_used_start:.0f}MT start → "
-                                 f"{camp.mt_used_end:.0f}MT end / {camp.roll_life}MT max")
-                camp_rows = [{"Seq": j+1, "Coil": c["coil"],
-                              "Width": c["width"], "Thick": c["thick"],
-                              "RT": c["rt"], "MT": c["mt"],
-                              "Customer": c["customer"], "Age(d)": c["age"]}
-                             for j, c in enumerate(camp.coils)]
-                st.dataframe(pd.DataFrame(camp_rows),
-                             use_container_width=True, hide_index=True)
-        if defer:
-            st.info("⏭️ Deferred (beyond shift capacity): " + " · ".join(defer))
-
-    st.divider()
-
-    # ══════════════════════════════════════════════════════════════════════
-    # D — CRS SEQUENCE OPTIMISER
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("🔧 D — CRS Sequence Optimiser")
-    crs = optimise_crs(selected_sections, rolled_coils=rolled)
-    if "error" in crs:
-        st.info(crs["error"])
+    # ── §1 Drill-down ─────────────────────────────────────────────────────
+    st.subheader("🔍 Drill-down")
+    d1, d2 = st.columns(2)
+    sel_cons  = d1.selectbox("Consumer", ["TUBE", "OEM", "H&T"], index=1)
+    sel_stage = d2.selectbox("Stage (optional)",
+                             ["— all stages —"] + sorted(df["stage"].unique()))
+    stg = None if sel_stage.startswith("—") else sel_stage
+    cb  = PIPE.customer_breakup(df, sel_cons, stg)
+    if cb.empty:
+        st.info("No material for this combination.")
     else:
-        xc1, xc2, xc3 = st.columns(3)
-        xc1.metric("CRS coils",         crs["total_coils"])
-        xc2.metric("Changes (original)", crs["original_changes"])
-        xc3.metric("Changes (optimised)",crs["optimised_changes"],
-                   delta=f"-{crs['saved']}" if crs["saved"] else "0",
-                   delta_color="inverse" if crs["saved"] > 0 else "off")
-        for r in crs["recommendations"]:
-            (st.success if r.startswith("✅") else st.warning)(r)
-        with st.expander("CRS sequence detail"):
-            crs_rows = []
-            for i, c in enumerate(crs["optimised"], 1):
-                ev = next((e for e in crs["change_events"]
-                           if e["position"] == i-1), None)
-                crs_rows.append({"Pos": i, "Coil": c["coil_number"],
-                    "Width": c["width"], "Thick": c["thick"],
-                    "MT": round(c["weight"],3), "Customer": c["customer"][:15],
-                    "Age(d)": c["age"],
-                    "⚠️ Change": " | ".join(ev["changes"]) if ev else ""})
-            st.dataframe(pd.DataFrame(crs_rows),
-                         use_container_width=True, hide_index=True)
-            st.download_button("⬇️ CRS sequence CSV",
-                data=pd.DataFrame(crs_rows).to_csv(index=False),
-                file_name="crs_sequence.csv", mime="text/csv",
-                use_container_width=True, key="dl_crs")
+        st.dataframe(cb.rename(columns={
+            "coils": "Coils", "mt": "MT", "avg_age": "Avg age (d)",
+            "max_age": "Oldest (d)", "qual_risk": "Quality risk"}),
+            use_container_width=True)
+        st.caption(f"{cb['mt'].sum():.1f} MT across {int(cb['coils'].sum())} "
+                   f"coils · {len(cb)} customers")
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════════════════
-    # E — COIL TICK-OFF
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("✅ E — Coil Confirmation (mark as rolled)")
-    tot_coils  = sum(s.n_coils for s in selected_sections)
-    done_coils = len(rolled)
-    st.progress(done_coils / max(tot_coils, 1),
-                text=f"Rolled: {done_coils}/{tot_coils} coils")
-    if rolled:
-        if st.button("🗑️ Clear rolled coils", key="clr"):
-            st.session_state.pa_rolled = set()
+    # ── §9 Material flow (Sankey-style edge table + chart) ────────────────
+    st.subheader("🔀 Material Flow — where WIP is heading")
+    edges = PIPE.flow_edges(df)
+    if edges.empty:
+        st.info("No flow edges above threshold.")
+    else:
+        top = edges.head(20).copy()
+        top["Flow"] = top["stage"] + "  →  " + top["next"]
+        st.dataframe(top[["Flow", "consumer", "mt", "coils"]].rename(
+            columns={"consumer": "Consumer", "mt": "MT", "coils": "Coils"}),
+            use_container_width=True, hide_index=True)
+        st.bar_chart(top.set_index("Flow")["mt"])
+
+    st.divider()
+
+    # ── §3 Inventory aging ────────────────────────────────────────────────
+    st.subheader("⏳ Inventory Aging Profile")
+    ap = PIPE.aging_profile(df)
+    ac1, ac2 = st.columns([2, 1])
+    ac1.bar_chart(ap[["TUBE", "OEM", "H&T"]])
+    ac2.dataframe(ap, use_container_width=True)
+    old = df[df["coil_age"] >= 21]
+    if len(old):
+        st.warning(f"⏰ **{len(old)} coils / {old['mt'].sum():.0f} MT** are "
+                   f"over 21 days old — rotate these into the plan.")
+        with st.expander("Show aged coils"):
+            st.dataframe(
+                old[["coil", "stage", "consumer", "customer", "mt",
+                     "coil_age", "stage_age", "age_band"]]
+                .sort_values("coil_age", ascending=False)
+                .rename(columns={"coil": "Coil", "stage": "Stage",
+                                 "consumer": "Consumer", "customer": "Customer",
+                                 "mt": "MT", "coil_age": "Coil age",
+                                 "stage_age": "Stage age", "age_band": "Band"}),
+                use_container_width=True, hide_index=True)
+
+    # ── Stuck WIP ─────────────────────────────────────────────────────────
+    sw = PIPE.stuck_wip(df)
+    if not sw.empty:
+        st.subheader("🚧 Stuck WIP (>21 days at one stage)")
+        st.dataframe(sw.rename(columns={
+            "coils": "Coils", "mt": "MT", "oldest": "Oldest (d)"}),
+            use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE — 🩺 STAGE HEALTH   (Guideline §4)
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🩺 Stage Health":
+    import pandas as pd
+    st.title("🩺 Stage Health Index")
+    st.caption("Inventory · consumption rate · days of cover · "
+               "starvation date · overload — for every stage and consumer")
+
+    _, df = wip_gate("wip_health")
+
+    with st.expander("⚙️ Daily demand (MT/day)"):
+        dc = st.columns(3)
+        demand = {}
+        for col, k in zip(dc, ("TUBE", "OEM", "H&T")):
+            demand[k] = col.number_input(
+                C.CONSUMERS[k]["label"], 0.0, 600.0,
+                float(C.CONSUMERS[k]["daily_mt"]), 5.0, key=f"dm_{k}")
+
+    ch = HLTH.consumer_health(df, overrides=demand)
+    sh = HLTH.stage_health(df)
+
+    # ── Alerts first ──────────────────────────────────────────────────────
+    al = HLTH.alerts(ch, sh)
+    if al:
+        st.subheader("🚨 Alerts")
+        for a in al:
+            if a.startswith("🔴"):   st.error(a)
+            elif a.startswith("🟠"): st.warning(a)
+            elif a.startswith("🟡"): st.warning(a)
+            else:                    st.info(a)
+    else:
+        st.success("✅ All stages and consumers healthy.")
+
+    st.divider()
+
+    # ── Consumer health ───────────────────────────────────────────────────
+    st.subheader("👥 Consumer Health — demand side")
+    cc = st.columns(3)
+    for col, x in zip(cc, ch.values()):
+        col.metric(f"{x.icon} {x.label}", f"{x.days_cover:.1f} d cover",
+                   f"{x.inventory_mt:.0f} MT buffer · {x.daily_rate:.0f} MT/day",
+                   delta_color="off")
+        if x.status == "CRITICAL":
+            col.error(f"Starves {x.starvation_date}")
+        elif x.status == "ATTENTION":
+            col.warning(f"Needs {x.shortfall_mt:.0f} MT")
+        elif x.status == "EXCESS":
+            col.warning(f"{x.excess_mt:.0f} MT excess")
+        else:
+            col.success("Healthy")
+    st.dataframe(HLTH.health_table(ch), use_container_width=True,
+                 hide_index=True)
+
+    st.divider()
+
+    # ── Stage health ──────────────────────────────────────────────────────
+    st.subheader("⚙️ Process Stage Health — supply side")
+    st.caption("Days of cover = how long the stage can keep running on "
+               "its current WIP. Low = starving. High = congested.")
+    ht = HLTH.health_table(sh)
+    st.dataframe(ht, use_container_width=True, hide_index=True)
+
+    chart = pd.DataFrame({
+        "Days cover": [x.days_cover for x in sh.values()],
+    }, index=[x.label for x in sh.values()])
+    st.bar_chart(chart)
+    st.caption("🔴 <1 day = starving · 🟡 <2 days = attention · "
+               "🟢 healthy · 🟠 >7 days = excess inventory")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE — 🎯 PLAN BUILDER   (Guideline §2, §5, §6, §7, §10)
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🎯 Plan Builder":
+    import pandas as pd
+    from datetime import date as _date
+
+    st.title("🎯 Plan Builder")
+    st.caption("Score sections → choose what to run → optimise roll campaigns "
+               "→ download the rolling plan")
+
+    wip_path, df = wip_gate("wip_plan")
+
+    # ── Setup ─────────────────────────────────────────────────────────────
+    with st.expander("⚙️ Setup — mode · rolls · demand",
+                     expanded="plan_result" not in st.session_state):
+        s1, s2 = st.columns([3, 1])
+        mode  = s1.selectbox("Planning mode", list(C.MODES.keys()),
+                             format_func=lambda k: C.MODES[k])
+        shift = s2.selectbox("Shift", [1, 2, 3], format_func=lambda x: f"Shift {x}")
+
+        st.markdown("**Rolls currently mounted**")
+        r1, r2 = st.columns(2)
+        with r1:
+            st.caption("CRM-04")
+            rt04 = st.selectbox("Roll type", C.ROLL_TYPES, key="p_rt04",
+                                index=C.ROLL_TYPES.index("Bright"))
+            mu04 = st.number_input("MT already rolled on this roll",
+                                   0.0, 400.0, 0.0, 5.0, key="p_mu04")
+        with r2:
+            st.caption("CRM-06")
+            rt06 = st.selectbox("Roll type", C.ROLL_TYPES, key="p_rt06",
+                                index=C.ROLL_TYPES.index("Light Matt"))
+            mu06 = st.number_input("MT already rolled on this roll",
+                                   0.0, 400.0, 0.0, 5.0, key="p_mu06")
+
+        st.markdown("**Daily demand (MT/day)**")
+        dcs = st.columns(3)
+        demand = {k: c.number_input(C.CONSUMERS[k]["label"], 0.0, 600.0,
+                                    float(C.CONSUMERS[k]["daily_mt"]), 5.0,
+                                    key=f"pd_{k}")
+                  for c, k in zip(dcs, ("TUBE", "OEM", "H&T"))}
+
+        if st.button("🚀 Score Sections", type="primary",
+                     use_container_width=True):
+            with st.spinner("Routing coils (validated Mill Planner) and scoring…"):
+                st.session_state.plan_result = PLAN.run_planning(
+                    path=wip_path, mode=mode,
+                    current_rolls={"CRM04": rt04, "CRM06": rt06},
+                    mt_on_rolls={"CRM04": mu04, "CRM06": mu06},
+                    demand=demand, db=load_db())
+                st.session_state.plan_cfg = dict(
+                    mode=mode, shift=shift, rt04=rt04, rt06=rt06,
+                    mu04=mu04, mu06=mu06, demand=demand)
+                st.session_state.pop("plan_selected", None)
             st.rerun()
 
-    for mill in ("CRM04","CRM06"):
-        st.markdown(f"**🏭 {mill}**")
-        for s in sorted([s for s in selected_sections if s.mill==mill],
-                        key=lambda x: x.priority_rank):
-            st.caption(f"{s.section_key.replace('_',' ').title()} "
-                       f"[{s.roll_type}] → {s.consumer}")
-            for _, row in s.coils_df.iterrows():
-                cn = str(row.get("Coil Number",""))
-                if cn in rolled:
-                    st.markdown(f"~~{cn}~~ ✅  "
-                                f"W={row.get('Actual Width',0):.0f} "
-                                f"T={row.get('Actual Thick',0):.2f} "
-                                f"{row.get('Input Coil Weight',0):.3f}MT")
-                else:
-                    age = float(row.get("Coil Age(# Days)",0) or 0)
-                    af  = "🔴" if age>21 else "🟡" if age>14 else ""
-                    c1, c2 = st.columns([5,1])
-                    c1.markdown(
-                        f"{af} **{cn}** "
-                        f"W={row.get('Actual Width',0):.0f}mm "
-                        f"T={row.get('Actual Thick',0):.2f}→"
-                        f"{row.get('Plan Rolling Thick 1',0):.2f}mm "
-                        f"{row.get('Input Coil Weight',0):.3f}MT "
-                        f"*{str(row.get('Customer Desc',''))[:15]}* "
-                        f"Age:{age:.0f}d")
-                    if c2.button("✅", key=f"roll_{mill}_{cn}"):
-                        st.session_state.pa_rolled.add(cn)
-                        st.rerun()
+    if "plan_result" not in st.session_state:
+        st.info("👆 Set your mode and rolls, then click **Score Sections**.")
+        st.stop()
+
+    R    = st.session_state.plan_result
+    cfg  = st.session_state.plan_cfg
+    ch   = R["consumer_health"]
+
+    # ── Alerts ────────────────────────────────────────────────────────────
+    for a in R["alerts"][:5]:
+        (st.error if a.startswith("🔴") else st.warning)(a)
+
+    # ── Consumer status strip ─────────────────────────────────────────────
+    cc = st.columns(3)
+    for col, k in zip(cc, ("TUBE", "OEM", "H&T")):
+        x = ch[k]
+        col.metric(f"{x.icon} {x.label}", f"{x.days_cover:.1f}d",
+                   f"{x.inventory_mt:.0f} MT buffer", delta_color="off")
 
     st.divider()
 
-    # ══════════════════════════════════════════════════════════════════════
-    # F — ROLLING SHEET DOWNLOAD (standard Tata Steel format)
-    # ══════════════════════════════════════════════════════════════════════
-    st.subheader("📄 F — Download Rolling Sheet")
-    st.caption("Excel with CRM-04 and CRM-06 on separate sheets, "
-               "matching standard plan format.")
+    # ── §2 Section scores (explainable) ───────────────────────────────────
+    st.subheader("📋 Section Priority — tick what you will run today")
+    if "plan_selected" not in st.session_state:
+        st.session_state.plan_selected = {s.section_key + s.mill: True
+                                          for s in R["scored"]}
 
-    def _build_excel(plan_choice_map):
-        from openpyxl import Workbook
-        from generator import write_sheet
-        # Build ordered section list per the chosen plan
-        ordered_all = []
-        for mill in ("CRM04","CRM06"):
-            d       = camp_data[mill]
-            use_key = plan_choice_map.get(mill, "prio")
-            camps   = d[use_key]
-            # Flatten campaign coils back to section order
-            sk_seen = []
-            for camp in camps:
-                for sk in camp.sections:
-                    if sk not in sk_seen:
-                        sk_seen.append(sk)
-            mill_sec_map = {s.section_key: s for s in selected_sections
-                            if s.mill == mill}
-            for sk in sk_seen:
-                if sk in mill_sec_map:
-                    # Reconstruct section dict for write_sheet
-                    s = mill_sec_map[sk]
-                    ordered_all.append({
-                        "section_key": sk,
-                        "mill": mill,
-                        "label": s.label,
-                        "coils_df": s.coils_df,
-                    })
-        wb = Workbook(); wb.remove(wb.active)
-        n, ws = write_sheet(wb, _date.today(), ordered_all, load_db())
-        buf = _io.BytesIO(); wb.save(buf); buf.seek(0)
-        return buf.getvalue()
+    selected: list = []
+    for mill in ("CRM04", "CRM06"):
+        ms = sorted([s for s in R["scored"] if s.mill == mill],
+                    key=lambda x: x.rank)
+        if not ms:
+            continue
+        st.markdown(f"#### 🏭 {mill}")
+        for s in ms:
+            key = s.section_key + s.mill
+            c1, c2 = st.columns([1, 11])
+            on = c1.checkbox("", value=st.session_state.plan_selected.get(key, True),
+                             key=f"cb_{key}")
+            st.session_state.plan_selected[key] = on
+            hi = "🔴" if s.score >= 60 else "🟡" if s.score >= 40 else "🟢"
+            with c2.expander(
+                f"{hi} **P{s.rank} · {s.section_key.replace('_',' ').title()}** — "
+                f"score {s.score:.0f} · {s.n_coils} coils · {s.total_mt:.1f} MT · "
+                f"[{s.roll_type}] → {C.CONSUMERS[s.consumer]['label']}",
+                expanded=False):
+                st.markdown(s.explanation)
+                for w in s.warnings:
+                    st.caption(w)
+                fc1, fc2 = st.columns([1, 1])
+                fc1.dataframe(SCORE.factor_table(s), hide_index=True,
+                              use_container_width=True)
+                fc2.markdown(
+                    f"- **Roll life**: {s.roll_life_mt} MT\n"
+                    f"- **Shift capacity**: {s.shift_cap_mt:.0f} MT "
+                    f"({s.sec_type.replace('_',' ')})\n"
+                    f"- **Oldest coil**: {s.max_age:.0f} days\n"
+                    f"- **Avg quality risk**: {s.qual_risk:.0f}/100")
+                if s.qual_risk >= 60:
+                    fc2.warning("Quality-critical — schedule under stable "
+                                "conditions, not straight after a roll change.")
+            if on:
+                selected.append(s)
 
-    dc1, dc2 = st.columns(2)
-    dc1.download_button(
-        "⬇️ Download Rolling Sheet (chosen plan)",
-        data=_build_excel(plan_choice),
-        file_name=f"rolling_sheet_{_date.today().strftime('%d-%m-%Y')}.xlsx",
+    if not selected:
+        st.warning("Select at least one section.")
+        st.stop()
+
+    # Re-plan campaigns using ONLY the ticked sections
+    plans = CAMP.compare_plans(
+        selected,
+        {"CRM04": cfg["rt04"], "CRM06": cfg["rt06"]},
+        {"CRM04": cfg["mu04"], "CRM06": cfg["mu06"]})
+
+    st.divider()
+
+    # ── §6 Roll campaign optimisation ─────────────────────────────────────
+    st.subheader("🔩 Roll Campaign — Priority vs Minimum-Changeover")
+
+    cmp_rows = []
+    for mill, d in plans.items():
+        for kind in ("priority", "alternate"):
+            mp = d[kind]
+            cmp_rows.append({
+                "Mill": mill,
+                "Plan": "⚡ Priority" if kind == "priority"
+                        else "🔩 Min changeover",
+                "Roll changes": mp.n_changes,
+                "Downtime (min)": mp.downtime_min,
+                "MT planned": mp.planned_mt,
+                "Coils": mp.n_coils,
+                "Utilisation %": mp.utilisation,
+            })
+    st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True,
+                 hide_index=True)
+
+    choice = {}
+    for mill, d in plans.items():
+        sv = d["savings_min"]
+        if sv > 0:
+            rec = d["recommend"]
+            opts = [f"⚡ Priority — {d['priority'].n_changes} change(s), "
+                    f"{d['priority'].downtime_min} min",
+                    f"🔩 Min changeover — {d['alternate'].n_changes} change(s), "
+                    f"{d['alternate'].downtime_min} min · saves {sv} min"]
+            idx = 1 if rec == "alternate" else 0
+            pick = st.radio(f"**{mill}** — recommended: **{rec}**",
+                            opts, index=idx, key=f"pick_{mill}")
+            choice[mill] = "alternate" if pick.startswith("🔩") else "priority"
+        else:
+            st.success(f"✅ **{mill}** — priority order already minimises "
+                       f"changeovers ({d['priority'].n_changes} change(s))")
+            choice[mill] = "priority"
+
+    # ── Chosen campaign detail ────────────────────────────────────────────
+    for mill, d in plans.items():
+        mp = d[choice[mill]]
+        st.markdown(f"#### 🏭 {mill} — {mp.planned_mt} MT · "
+                    f"{mp.n_coils} coils · {mp.n_changes} roll change(s) · "
+                    f"{mp.downtime_min} min downtime · "
+                    f"{mp.utilisation}% of {mp.capacity_mt:.0f} MT capacity")
+        for i, camp in enumerate(mp.campaigns, 1):
+            if camp.needs_change:
+                st.markdown(f"🔄 **ROLL CHANGE: {camp.change_from} → "
+                            f"{camp.roll_type}** · {C.ROLL_CHANGE_MIN} min")
+            with st.expander(
+                f"Campaign {i} · **{camp.roll_type}** — {camp.n_coils} coils · "
+                f"{camp.total_mt:.1f} MT"
+                + ("  ⚠️ exceeds roll life" if camp.over_life else ""),
+                expanded=(i == 1)):
+                st.progress(camp.life_pct,
+                            text=f"Roll life {camp.mt_start:.0f} → "
+                                 f"{camp.mt_end:.0f} MT of {camp.roll_life} MT")
+                for w in camp.warnings:
+                    st.warning(w)
+                st.dataframe(pd.DataFrame([{
+                    "Seq": j + 1, "Coil": c["coil"],
+                    "Section": c["section"].replace("_", " ").title(),
+                    "Width": c["width"], "Thick": c["thick"], "RT": c["rt"],
+                    "MT": c["mt"], "Grade": c["quality"],
+                    "Customer": c["customer"], "Age (d)": c["age"],
+                    "Qual risk": c["qual_risk"],
+                } for j, c in enumerate(camp.coils)]),
+                    use_container_width=True, hide_index=True)
+        if mp.deferred:
+            st.info("⏭️ **Deferred** (beyond shift capacity): " +
+                    " · ".join(mp.deferred))
+
+    st.divider()
+
+    # ── §5 Download the rolling plan ──────────────────────────────────────
+    st.subheader("📄 Download Rolling Plan")
+    st.caption("Standard Tata Steel format, sequenced exactly as chosen above.")
+    xl = PLAN.export_excel(selected, plans, choice, load_db())
+    st.download_button(
+        "⬇️ Download Mill Plan (Excel)", data=xl,
+        file_name=f"mill_plan_{_date.today().strftime('%d-%m-%Y')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True, key="dl_sheet")
+        type="primary", use_container_width=True)
 
-    # Forecast
-    with st.expander("📉 7-Day Consumer Buffer Forecast"):
-        fc = forecast_depletion(raw_df, selected_sections, cons_ovr)
-        proj = []
-        for cname, r in fc.items():
-            for p in r["projection"]:
-                proj.append({"Date": p["date"], "Consumer": cname,
-                             "Buffer MT": p["buffer_mt"]})
-        if proj:
-            pivot = pd.DataFrame(proj).pivot(index="Date",
-                columns="Consumer", values="Buffer MT")
-            st.line_chart(pivot)
-            st.caption("Lines hitting zero = starvation on that date")
+    # Persist for the Digital Twin page
+    st.session_state.chosen_plans = {m: plans[m][choice[m]] for m in plans}
+    st.session_state.plan_demand  = cfg["demand"]
+    st.caption("✅ This plan is now loaded into the **Digital Twin** page.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE — 🔮 DIGITAL TWIN   (Guideline §8, §9)
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🔮 Digital Twin":
+    import pandas as pd
+    st.title("🔮 Digital Twin — Future Pipeline")
+    st.caption("What will the pipeline look like if today's plan is executed?")
+
+    _, df = wip_gate("wip_twin")
+
+    plans  = st.session_state.get("chosen_plans")
+    demand = st.session_state.get("plan_demand")
+
+    tc1, tc2 = st.columns([1, 2])
+    horizon = tc1.slider("Horizon (days)", 3, 14, 7)
+    repeat  = tc2.toggle("Assume a similar plan runs every day (steady state)",
+                         value=True)
+
+    if plans:
+        st.success("✅ Simulating **with** today's plan from Plan Builder.")
+    else:
+        st.warning("⚠️ No plan loaded — simulating **without** any new rolling. "
+                   "Build a plan first to see its effect.")
+
+    t = TWIN.simulate(df, plans, horizon=horizon,
+                      overrides=demand, repeat_plan=repeat)
+
+    # ── Predicted problems ────────────────────────────────────────────────
+    st.subheader("🚨 Predicted Bottlenecks & Starvation")
+    if t.bottlenecks:
+        for b in t.bottlenecks:
+            (st.error if b.startswith("🔴") else st.warning)(b)
+    else:
+        st.success("✅ No starvation or congestion predicted in this horizon.")
+
+    st.divider()
+
+    # ── Consumer buffer projection ────────────────────────────────────────
+    st.subheader("📉 Consumer Buffer Projection")
+    tf = TWIN.twin_frame(t)
+    st.line_chart(tf)
+    st.caption("A line reaching zero = that consumer starves on that date.")
+    st.dataframe(tf, use_container_width=True)
+
+    # ── Stage WIP projection ──────────────────────────────────────────────
+    st.subheader("⚙️ Stage WIP Projection")
+    sf = TWIN.stage_frame(t)
+    st.line_chart(sf)
+    st.caption("Rising line = WIP building up (congestion). "
+               "Falling to zero = stage starving.")
+
+    # ── Dispatch readiness ────────────────────────────────────────────────
+    st.subheader("📦 Dispatch Readiness — MT arriving per day")
+    dr = pd.DataFrame(
+        {C.CONSUMERS[c]["label"]: t.dispatch_ready[c] for c in t.dispatch_ready},
+        index=t.dates)
+    st.bar_chart(dr)
+    st.dataframe(dr, use_container_width=True)
