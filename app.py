@@ -567,542 +567,475 @@ elif page == "📊 Stats":
 
 
 elif page == "🎯 Priority Advisor":
-    import pandas as pd
+    import io as _io, pandas as pd
+    from datetime import date as _date
     from priority_advisor import (
-        compute_priority, MODES, CONFIG,
-        forecast_depletion, build_rolling_sheet, optimise_crs_sequence,
-        build_consumer_coverage,
+        MODES, CONFIG, ROLL_TYPES, get_roll_life,
+        build_coverage, score_sections, build_roll_campaigns,
+        build_alternate_order, optimise_crs, forecast_depletion,
     )
 
-    # Roll types — inline fallback so no external import needed at module level
-    ROLL_TYPES    = ["Light Matt", "Bright", "Super Bright", "Chrome Plated", "Heavy Matt"]
-    ROLL_LIFE_MAX = {"Light Matt": 300, "Bright": 180, "Super Bright": 120,
-                     "Chrome Plated": 80, "Heavy Matt": 200}
-    ROLL_CHANGE_MIN = 45
-
     st.title("🎯 Priority Advisor")
-    SICON = {"CRITICAL": "🔴", "WARNING": "🟠", "WATCH": "🟡", "OK": "🟢"}
+    st.caption("Plan your shift: select sections to run, get roll campaign "
+               "sequence, check consumer coverage, download rolling sheet.")
 
-    # ── Session state for rolled coils ────────────────────────────────────
-    if "rolled_coils" not in st.session_state:
-        st.session_state.rolled_coils = set()
-    if "pa_sections" not in st.session_state:
-        st.session_state.pa_sections = None
-    if "pa_raw_df" not in st.session_state:
-        st.session_state.pa_raw_df = None
-    if "pa_result" not in st.session_state:
-        st.session_state.pa_result = None
+    SICON = {"CRITICAL":"🔴","WARNING":"🟠","WATCH":"🟡","OK":"🟢"}
+
+    # ── Session state ─────────────────────────────────────────────────────
+    for k, v in [("pa_sections", None), ("pa_raw", None),
+                 ("pa_result", None), ("pa_selected", {}),
+                 ("pa_rolled", set())]:
+        if k not in st.session_state:
+            st.session_state[k] = v
 
     # ══════════════════════════════════════════════════════════════════════
-    # INPUTS PANEL
+    # STEP 1 — SETUP
     # ══════════════════════════════════════════════════════════════════════
-    with st.expander("⚙️ Setup", expanded=st.session_state.pa_sections is None):
-        wip_pa = st.file_uploader("WIP file", type=["xlsx"], key="wip_pa_v3")
+    with st.expander("⚙️ Step 1 — Setup",
+                     expanded=st.session_state.pa_sections is None):
+        wip_file = st.file_uploader("Today's WIP file", type=["xlsx"],
+                                    key="pa_wip")
 
-        ic1, ic2 = st.columns(2)
-        mode     = ic1.selectbox("Planning mode",
-            list(MODES.keys()), format_func=lambda k: MODES[k])
-        shift_no = ic2.selectbox("Shift", [1,2,3],
-            format_func=lambda x: f"Shift {x}")
-
-        st.markdown("**Current rolls**")
-        rca, rcb = st.columns(2)
-        with rca:
+        sc1, sc2, sc3 = st.columns(3)
+        mode     = sc1.selectbox("Planning mode", list(MODES.keys()),
+                                 format_func=lambda k: MODES[k])
+        shift_no = sc2.selectbox("Shift", [1,2,3],
+                                 format_func=lambda x: f"Shift {x}")
+        st.markdown("**Current rolls on mills**")
+        rc1, rc2 = st.columns(2)
+        with rc1:
             st.caption("CRM-04")
-            rt04     = st.selectbox("Roll type", ROLL_TYPES, key="rt04v3")
-            mtr04    = st.number_input("MT remaining", 0.0,
-                float(ROLL_LIFE_MAX[rt04]), float(ROLL_LIFE_MAX[rt04])*0.5,
-                10.0, key="mtr04v3")
-            st.progress(int(mtr04/ROLL_LIFE_MAX[rt04]*100),
-                        text=f"{mtr04/ROLL_LIFE_MAX[rt04]*100:.0f}% life")
-        with rcb:
+            rt04  = st.selectbox("Roll type", ROLL_TYPES, key="rt04")
+            mu04  = st.number_input("MT already rolled on this roll",
+                                    0.0, 500.0, 0.0, 5.0, key="mu04")
+        with rc2:
             st.caption("CRM-06")
-            idx06    = ROLL_TYPES.index("Light Matt") if "Light Matt" in ROLL_TYPES else 0
-            rt06     = st.selectbox("Roll type", ROLL_TYPES, key="rt06v3", index=idx06)
-            mtr06    = st.number_input("MT remaining", 0.0,
-                float(ROLL_LIFE_MAX[rt06]), float(ROLL_LIFE_MAX[rt06])*0.5,
-                10.0, key="mtr06v3")
-            st.progress(int(mtr06/ROLL_LIFE_MAX[rt06]*100),
-                        text=f"{mtr06/ROLL_LIFE_MAX[rt06]*100:.0f}% life")
+            idx06 = ROLL_TYPES.index("Light Matt")
+            rt06  = st.selectbox("Roll type", ROLL_TYPES, key="rt06",
+                                 index=idx06)
+            mu06  = st.number_input("MT already rolled on this roll",
+                                    0.0, 500.0, 0.0, 5.0, key="mu06")
 
-        cpc1, cpc2 = st.columns(2)
-        cap04 = cpc1.number_input("CRM-04 capacity MT/day", 50.0, 300.0, 165.0, 5.0)
-        cap06 = cpc2.number_input("CRM-06 capacity MT/day", 50.0, 300.0, 185.0, 5.0)
+        # Show roll life remaining
+        _cr1, _cr2 = st.columns(2)
+        _life04 = get_roll_life(rt04, "HT_FINISH" if rt04=="Bright"
+                                else "RE_ROLLING")
+        _life06 = get_roll_life(rt06, "FIRST_ROLLING")
+        _rem04  = max(0, _life04 - mu04)
+        _rem06  = max(0, _life06 - mu06)
+        _cr1.progress(int(_rem04/_life04*100) if _life04 else 0,
+                      text=f"CRM-04 {rt04}: {_rem04:.0f}MT remaining ({_life04}MT life)")
+        _cr2.progress(int(_rem06/_life06*100) if _life06 else 0,
+                      text=f"CRM-06 {rt06}: {_rem06:.0f}MT remaining ({_life06}MT life)")
 
-        st.markdown("**Consumption rates (MT/day)** — adjust to actuals")
-        cons_cols = st.columns(4)
-        cons_ovr  = {}
-        for col, cname in zip(cons_cols, ["H&T Line","Tube Plant","OEM","Annealing"]):
-            def_val = CONFIG["consumers"].get(cname, {}).get("daily_mt", 50.0)
-            cons_ovr[cname] = col.number_input(cname, 0.0, 500.0,
-                float(def_val), 5.0, key=f"cons_{cname}")
+        st.markdown("**Consumption overrides (MT/day)** — leave as-is if no change")
+        _cc1, _cc2, _cc3 = st.columns(3)
+        cons_ovr = {
+            "H&T Line":   _cc1.number_input("H&T Line", 0.0, 200.0,
+                float(CONFIG["consumers"]["H&T Line"]["daily_mt"]), 5.0),
+            "Tube Plant": _cc2.number_input("Tube Plant", 0.0, 500.0,
+                float(CONFIG["consumers"]["Tube Plant"]["daily_mt"]), 5.0),
+            "OEM":        _cc3.number_input("OEM", 0.0, 300.0,
+                float(CONFIG["consumers"]["OEM"]["daily_mt"]), 5.0),
+        }
 
-        run_btn = st.button("🚀 Generate Plan & Run Analysis",
+        run_btn = st.button("🚀 Load WIP & Score Sections",
                             type="primary", use_container_width=True,
-                            disabled=wip_pa is None)
+                            disabled=wip_file is None)
 
-    if run_btn and wip_pa:
-        with st.spinner("Running…"):
+    if run_btn and wip_file:
+        with st.spinner("Loading WIP and scoring sections…"):
             try:
                 import tempfile, os as _os
-                from generator import load_wip, filter_rolling_coils, \
-                                       assign_all, build_sections
-                wip_pa.seek(0)
-                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
-                    t.write(wip_pa.read()); fp = t.name
+                from generator import load_wip, filter_rolling_coils,                                        assign_all, build_sections
+                wip_file.seek(0)
+                with tempfile.NamedTemporaryFile(suffix=".xlsx",
+                                                  delete=False) as t:
+                    t.write(wip_file.read()); fp = t.name
                 raw_df = pd.read_excel(fp)
                 wip_df = load_wip(fp)
                 secs   = build_sections(
-                    assign_all(filter_rolling_coils(wip_df), load_db()), load_db())
+                    assign_all(filter_rolling_coils(wip_df), load_db()),
+                    load_db())
                 _os.unlink(fp)
-                pr = compute_priority(secs, wip_df=raw_df,
-                                      mode=mode, shift_no=shift_no,
-                                      downstream_demand=cons_ovr)
+                coverage = build_coverage(raw_df, cons_ovr)
+                scored   = score_sections(secs, coverage, mode,
+                                          {"CRM04": rt04, "CRM06": rt06})
                 st.session_state.pa_sections  = secs
-                st.session_state.pa_raw_df    = raw_df
-                st.session_state.pa_result    = pr
+                st.session_state.pa_raw       = raw_df
+                st.session_state.pa_result    = scored
+                st.session_state.pa_coverage  = coverage
                 st.session_state.pa_mode      = mode
                 st.session_state.pa_shift     = shift_no
-                st.session_state.pa_cap04     = cap04
-                st.session_state.pa_cap06     = cap06
                 st.session_state.pa_rt04      = rt04
                 st.session_state.pa_rt06      = rt06
-                st.session_state.pa_mtr04     = mtr04
-                st.session_state.pa_mtr06     = mtr06
+                st.session_state.pa_mu04      = mu04
+                st.session_state.pa_mu06      = mu06
                 st.session_state.pa_cons_ovr  = cons_ovr
+                st.session_state.pa_selected  = {
+                    s.section_key: True for s in scored}
+                st.session_state.pa_rolled    = set()
                 st.rerun()
             except Exception as e:
                 st.error(f"Error: {e}")
                 import traceback; st.code(traceback.format_exc())
 
     if st.session_state.pa_sections is None:
-        st.info("👆 Upload WIP file and click **Generate Plan & Run Analysis**.")
+        st.info("👆 Upload WIP file and click **Load WIP & Score Sections**.")
         st.stop()
 
-    # ── Restore state ─────────────────────────────────────────────────────
+    # Restore state
+    scored    = st.session_state.pa_result
+    coverage  = st.session_state.pa_coverage
     secs      = st.session_state.pa_sections
-    raw_df    = st.session_state.pa_raw_df
-    pr        = st.session_state.pa_result
-    mode      = st.session_state.get("pa_mode", "H&T_FIRST")
-    shift_no  = st.session_state.get("pa_shift", 1)
-    cap04     = st.session_state.get("pa_cap04", 165.0)
-    cap06     = st.session_state.get("pa_cap06", 185.0)
+    raw_df    = st.session_state.pa_raw
+    mode      = st.session_state.get("pa_mode", "H&T_PRIORITY")
     rt04      = st.session_state.get("pa_rt04", "Bright")
     rt06      = st.session_state.get("pa_rt06", "Light Matt")
-    mtr04     = st.session_state.get("pa_mtr04", 90.0)
-    mtr06     = st.session_state.get("pa_mtr06", 150.0)
+    mu04      = st.session_state.get("pa_mu04", 0.0)
+    mu06      = st.session_state.get("pa_mu06", 0.0)
     cons_ovr  = st.session_state.get("pa_cons_ovr", {})
-    rolled    = st.session_state.rolled_coils
+    rolled    = st.session_state.pa_rolled
 
-    # ── Re-score when mode changes ────────────────────────────────────────
-    remode = st.selectbox("🔄 Change mode without re-uploading",
+    # Live mode change without re-upload
+    new_mode = st.selectbox("🔄 Change mode (live re-score)",
         list(MODES.keys()), format_func=lambda k: MODES[k],
-        index=list(MODES.keys()).index(mode) if mode in MODES else 0,
-        key="pa_remode")
-    if remode != mode:
-        pr = compute_priority(secs, wip_df=raw_df,
-                              mode=remode, shift_no=shift_no,
-                              downstream_demand=cons_ovr)
-        st.session_state.pa_result = pr
-        st.session_state.pa_mode   = remode
-        mode = remode
-
-    for w in pr["warnings"]:
-        st.warning(w)
+        index=list(MODES.keys()).index(mode),
+        key="pa_live_mode")
+    if new_mode != mode:
+        cov2   = build_coverage(raw_df, cons_ovr)
+        scored = score_sections(secs, cov2, new_mode,
+                                {"CRM04": rt04, "CRM06": rt06})
+        st.session_state.pa_result   = scored
+        st.session_state.pa_mode     = new_mode
+        st.session_state.pa_coverage = cov2
+        coverage = cov2
+        mode     = new_mode
 
     # ══════════════════════════════════════════════════════════════════════
-    # A — COVERAGE BOARD
+    # A — CONSUMER COVERAGE
     # ══════════════════════════════════════════════════════════════════════
     st.subheader("📊 A — Consumer Coverage")
-    cov_items = sorted(pr["coverage"].items(),
-                       key=lambda x: x[1].priority, reverse=True)
-    cov_cols  = st.columns(len(cov_items))
-    for col, (cname, cov) in zip(cov_cols, cov_items):
+    cov_cols = st.columns(3)
+    for col, (cname, cov) in zip(
+            cov_cols,
+            sorted(coverage.items(), key=lambda x: -x[1].daily_mt)):
         col.metric(f"{SICON[cov.status]} {cname}",
-                   f"{cov.coverage_today:.1f}d",
-                   f"Buffer {cov.buffer_mt:.0f}MT + Plan {cov.incoming_today_mt:.0f}MT",
+                   f"{cov.coverage_days:.1f}d cover",
+                   f"Buffer {cov.buffer_mt:.0f}MT | Ask {cov.daily_mt:.0f}MT/day",
                    delta_color="off")
-        if cov.required_today_mt > 0:
-            col.caption(f"⚡ Roll {cov.required_today_mt:.0f}MT for 3-day cover")
-
-    # 7-day chart
-    with st.expander("📉 7-Day Depletion Forecast"):
-        fc = forecast_depletion(raw_df, secs, cons_ovr)
-        proj_rows = []
-        for cname, r in fc.items():
-            for p in r["projection"]:
-                proj_rows.append({"Day": p["date"], "Consumer": cname,
-                                   "Buffer MT": p["buffer_mt"]})
-        if proj_rows:
-            pivot = (pd.DataFrame(proj_rows)
-                     .pivot(index="Day", columns="Consumer", values="Buffer MT"))
-            st.line_chart(pivot)
-            st.caption("Lines hitting zero = starvation on that date")
+        if cov.shortfall_mt > 0:
+            col.caption(f"⚡ Need {cov.shortfall_mt:.0f}MT to reach target")
+    for cname, cov in coverage.items():
+        if cov.status == "CRITICAL":
+            st.error(f"🔴 {cname} CRITICAL — only {cov.coverage_days:.1f}d cover")
+        elif cov.status == "WARNING":
+            st.warning(f"🟠 {cname} WARNING — {cov.coverage_days:.1f}d cover")
 
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════
-    # B — LIVE ROLLING SHEET (coil confirmation + re-planning)
+    # B — SELECT SECTIONS FOR TODAY
     # ══════════════════════════════════════════════════════════════════════
-    st.subheader("🏭 B — Rolling Plan & Coil Confirmation")
+    st.subheader("☑️ B — Select Sections to Run Today")
+    st.caption("Tick sections you plan to run. System will sequence them "
+               "per mill with minimum roll changes.")
 
-    rolled_count = len(rolled)
-    total_coils  = sum(len(s["coils_df"]) for s in secs)
-    rolled_mt    = sum(
-        float(r.get("Input Coil Weight", 0) or 0)
-        for s in secs
-        for _, r in s["coils_df"].iterrows()
-        if str(r.get("Coil Number","")) in rolled)
+    selected_keys = set()
+    for mill in ("CRM04", "CRM06"):
+        mill_scored = sorted([s for s in scored if s.mill == mill],
+                             key=lambda x: x.priority_rank)
+        if not mill_scored:
+            continue
+        st.markdown(f"**🏭 {mill}**")
+        cap_type_map = {"first_rolling": "first_rolling",
+                        "re_rolling": "re_rolling", "finishing": "finishing",
+                        "rolling": "re_rolling"}
+        for s in mill_scored:
+            cap_type = ("first_rolling" if s.section_key == "FIRST_ROLLING"
+                        else "re_rolling" if s.section_key in
+                             ("RE_ROLLING","ROLLING")
+                        else "finishing")
+            shift_cap = CONFIG["shift_capacity"][mill].get(cap_type, 80)
+            age_flag  = (f" 🔴 oldest={s.coils_df['Coil Age(# Days)'].max():.0f}d"
+                         if hasattr(s.coils_df,'iterrows') and
+                            float(s.coils_df["Coil Age(# Days)"].max()) > 14
+                         else "")
+            checked = st.session_state.pa_selected.get(s.section_key, True)
+            col_cb, col_info = st.columns([1, 8])
+            new_val = col_cb.checkbox("", value=checked,
+                                      key=f"sel_{mill}_{s.section_key}")
+            st.session_state.pa_selected[s.section_key] = new_val
+            col_info.markdown(
+                f"**P{s.priority_rank}. {s.section_key.replace('_',' ').title()}**"
+                f" [{s.roll_type}] · {s.n_coils}c · {s.total_mt:.1f}MT"
+                f" · {SICON[coverage.get(s.consumer, type('x',(),{'status':'OK'})()).status] if hasattr(coverage.get(s.consumer, None),'status') else '⚪'} {s.consumer}"
+                f"{age_flag}  `shift cap {shift_cap}MT`")
+            if new_val:
+                selected_keys.add(s.section_key)
 
-    pcol1, pcol2, pcol3 = st.columns(3)
-    pcol1.metric("Rolled this shift", f"{rolled_count} coils",
-                 f"{rolled_mt:.1f} MT")
-    pcol2.metric("Remaining", f"{total_coils - rolled_count} coils")
-    pcol3.metric("Progress", f"{rolled_count/max(total_coils,1)*100:.0f}%")
-    st.progress(rolled_count / max(total_coils, 1))
-
-    if rolled_count > 0:
-        if st.button("🔄 Re-prioritise remaining coils", key="replan_btn"):
-            pr = compute_priority(secs, wip_df=raw_df,
-                                  mode=mode, shift_no=shift_no,
-                                  downstream_demand=cons_ovr)
-            st.session_state.pa_result = pr
-            st.rerun()
-        if st.button("🗑️ Clear rolled coils", key="clear_rolled"):
-            st.session_state.rolled_coils = set()
-            st.rerun()
-
-    sheets = build_rolling_sheet(secs, pr, rolled_coils=rolled)
-
-    mill_tab04, mill_tab06 = st.tabs(["🏭 CRM-04", "🏭 CRM-06"])
-    for mill_tab, mill, roll_type, mt_rem in [
-            (mill_tab04, "CRM04", rt04, mtr04),
-            (mill_tab06, "CRM06", rt06, mtr06)]:
-        with mill_tab:
-            # Roll status bar
-            life_pct = int(mt_rem / ROLL_LIFE_MAX.get(roll_type, 200) * 100)
-            st.progress(life_pct,
-                text=f"Current roll: {roll_type}  ·  {mt_rem:.0f}MT remaining  ·  {life_pct}% life")
-
-            for item in sheets[mill]:
-                if item["type"] == "header":
-                    pending = item["pending_count"]
-                    done    = item["done_count"]
-                    st.markdown(
-                        f"**⬛ P{item['priority']}: {item['section'].replace('_',' ').title()}** "
-                        f"— {item['consumer']}  ·  {pending} pending / {done} rolled  ·  {item['pending_mt']}MT left")
-                else:
-                    if item["rolled"]:
-                        st.markdown(
-                            f"~~{item['coil']}~~ ✅ rolled  "
-                            f"W={item['width']:.0f} T={item['thick']:.2f} "
-                            f"{item['weight']}MT",
-                            help="Already rolled this shift")
-                    else:
-                        col_coil, col_btn = st.columns([4, 1])
-                        age_flag = "🔴" if item["age"] > 21 else "🟡" if item["age"] > 14 else ""
-                        col_coil.markdown(
-                            f"**{item['seq']}. {item['coil']}** {age_flag}  "
-                            f"W={item['width']:.0f}mm  T={item['thick']:.2f}→{item['rt']:.2f}mm  "
-                            f"{item['weight']}MT  *{item['customer']}*  Age:{item['age']:.0f}d")
-                        if col_btn.button("✅", key=f"roll_{mill}_{item['coil']}",
-                                          help="Mark as rolled"):
-                            st.session_state.rolled_coils.add(item["coil"])
-                            st.rerun()
+    selected_sections = [s for s in scored
+                         if s.section_key in selected_keys]
+    if not selected_sections:
+        st.warning("No sections selected. Tick at least one above.")
+        st.stop()
 
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════
-    # C — ROLL CAMPAIGN & CHANGE OPTIMISATION
+    # C — ROLL CAMPAIGN PLAN
     # ══════════════════════════════════════════════════════════════════════
     st.subheader("🔩 C — Roll Campaign Plan")
 
-    # Section → roll type mapping
-    SEC_TO_ROLL = {
-        "ROLLING": "Light Matt", "FIRST_ROLLING": "Light Matt",
-        "RE_ROLLING": "Light Matt", "HT_FINISH": "Bright",
-        "CRCA_FINISH": "Bright", "CRCA_FINISH_CRM06": "Bright",
-        "TUBE_FH": "Bright", "SKIN_PASS_SUPER_BRIGHT": "Super Bright",
-        "SKIN_PASS_CHROME": "Chrome Plated", "ROLLING_BRIGHT": "Chrome Plated",
-        "SKIN_PASS_HEAVY_MATT": "Heavy Matt",
-    }
-
-    for mill, current_rt, mt_remaining, capacity in [
-            ("CRM04", rt04, mtr04, cap04),
-            ("CRM06", rt06, mtr06, cap06)]:
-        st.markdown(f"#### 🏭 {mill}")
-        mill_secs   = [s for s in secs if s["mill"] == mill]
-        seq_key     = "crm04_sequence" if mill == "CRM04" else "crm06_sequence"
-        priority_seq = pr.get(seq_key, [])
-        rank_map     = {s.section_key: (s.rank_crm04 if mill == "CRM04"
-                                         else s.rank_crm06)
-                        for s in priority_seq}
-        mill_secs.sort(key=lambda s: rank_map.get(s["section_key"], 99))
-
-        # Build campaigns
-        remaining_cap = capacity
-        current_roll  = current_rt
-        mt_on_roll    = mt_remaining
-        campaigns     = []
-
-        for s in mill_secs:
-            sk         = s["section_key"]
-            needed_rt  = SEC_TO_ROLL.get(sk, "Light Matt")
-            sec_mt     = float(s["coils_df"]["Input Coil Weight"].sum())
-
-            if needed_rt != current_roll:
-                # Roll change needed
-                change_cap = remaining_cap * (ROLL_CHANGE_MIN / 480)
-                remaining_cap -= change_cap
-                mt_on_roll    = ROLL_LIFE_MAX.get(needed_rt, 200)
-                current_roll  = needed_rt
-                campaigns.append({
-                    "type": "change",
-                    "from_roll": current_roll, "to_roll": needed_rt,
-                    "cost_min": ROLL_CHANGE_MIN,
-                })
-
-            if remaining_cap <= 0:
-                campaigns.append({"type": "deferred", "section": sk, "mt": sec_mt})
-                continue
-
-            rollable = min(sec_mt, remaining_cap, mt_on_roll)
-            deferred = sec_mt - rollable
-            remaining_cap -= rollable
-            mt_on_roll    -= rollable
-            campaigns.append({
-                "type": "section", "section": sk, "roll": needed_rt,
-                "rollable_mt": round(rollable, 1),
-                "deferred_mt": round(deferred, 1),
-                "consumer": CONFIG["section_to_consumer"].get(sk, ""),
-            })
-
-        # Render campaigns
-        for c in campaigns:
-            if c["type"] == "change":
-                st.markdown(f"🔄 **Roll change → {c['to_roll']}** ({c['cost_min']} min)")
-            elif c["type"] == "deferred":
-                st.caption(f"⏭️ {c['section']} deferred ({c['mt']:.0f}MT) — beyond capacity")
+    def _shift_cap(mill: str, sections: List) -> float:
+        """Estimate shift capacity based on mix of selected sections."""
+        types = {"first_rolling":0,"re_rolling":0,"finishing":0}
+        for s in sections:
+            if s.mill != mill: continue
+            if s.section_key == "FIRST_ROLLING":
+                types["first_rolling"] += s.total_mt
+            elif s.section_key in ("RE_ROLLING","ROLLING"):
+                types["re_rolling"] += s.total_mt
             else:
-                bar = int(c["rollable_mt"] / max(c["rollable_mt"] + c["deferred_mt"], 0.01) * 20)
-                st.markdown(
-                    f"  {'█'*bar}{'░'*(20-bar)} "
-                    f"**{c['section'].replace('_',' ').title()}** "
-                    f"[{c['roll']}]  {c['rollable_mt']}MT → {c['consumer']}"
-                    + (f"  _(+{c['deferred_mt']:.0f}MT deferred)_" if c['deferred_mt'] > 0 else ""))
-        st.divider()
+                types["finishing"] += s.total_mt
+        tot = sum(types.values()) or 1
+        cap = CONFIG["shift_capacity"][mill]
+        return (types["first_rolling"]/tot * cap["first_rolling"] +
+                types["re_rolling"]  /tot * cap["re_rolling"] +
+                types["finishing"]   /tot * cap["finishing"])
 
-    # ══════════════════════════════════════════════════════════════════════
-    # C2 — MILL PLAN (PRIORITY ORDER + ROLL OPTIMISATION)   SPEC §07.7
-    # ══════════════════════════════════════════════════════════════════════
-    from priority_advisor import (build_plan_comparison, count_roll_changes,
-                                   SEC_TO_ROLL as PA_SEC_TO_ROLL,
-                                   ROLL_CHANGE_MIN as PA_CHANGE_MIN)
+    plan_compare_rows = []
+    camp_data = {}
 
-    with st.expander("📋 C2 — Mill Plan (Priority Order + Roll Optimisation)",
-                     expanded=True):
-        comp = build_plan_comparison(secs, pr, rt04, rt06)
-        prio = comp["priority"]
-        alt  = comp["alternate"]
+    for mill, cur_roll, mt_used in [
+            ("CRM04", rt04, mu04), ("CRM06", rt06, mu06)]:
+        mill_secs_prio = sorted(
+            [s for s in selected_sections if s.mill == mill],
+            key=lambda x: x.priority_rank)
+        mill_secs_alt  = build_alternate_order(
+            selected_sections, cur_roll, mill)
+        sh_cap = _shift_cap(mill, selected_sections)
 
-        # ── Comparison table (only when alternate exists) ─────────────────
-        if alt:
-            st.markdown("#### Plan Comparison")
-            comp_df = pd.DataFrame([
-                {"": "CRM-04 roll changes",
-                 "⚡ Priority Plan": prio["changes04"],
-                 "🔩 Alternate Plan": alt["changes04"]},
-                {"": "CRM-06 roll changes",
-                 "⚡ Priority Plan": prio["changes06"],
-                 "🔩 Alternate Plan": alt["changes06"]},
-                {"": "Total changes",
-                 "⚡ Priority Plan": prio["total_changes"],
-                 "🔩 Alternate Plan": alt["total_changes"]},
-                {"": "Downtime (min)",
-                 "⚡ Priority Plan": prio["downtime_min"],
-                 "🔩 Alternate Plan": alt["downtime_min"]},
-                {"": "Savings (min)",
-                 "⚡ Priority Plan": "—",
-                 "🔩 Alternate Plan": alt["savings_min"]},
-            ])
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+        camps_prio, defer_prio, nc_prio, dt_prio = build_roll_campaigns(
+            mill_secs_prio, cur_roll, mt_used, mill, sh_cap)
+        camps_alt, defer_alt, nc_alt, dt_alt = build_roll_campaigns(
+            mill_secs_alt, cur_roll, mt_used, mill, sh_cap)
 
-            for w in comp["warnings"]:
-                st.warning(w)
+        camp_data[mill] = {
+            "prio": camps_prio, "alt": camps_alt,
+            "defer_prio": defer_prio, "defer_alt": defer_alt,
+            "nc_prio": nc_prio, "nc_alt": nc_alt,
+            "dt_prio": dt_prio, "dt_alt": dt_alt,
+            "sh_cap": sh_cap, "cur_roll": cur_roll, "mt_used": mt_used,
+        }
+        plan_compare_rows.append({
+            "Mill": mill,
+            "Plan": "Priority",
+            "Roll changes": nc_prio,
+            "Downtime (min)": dt_prio,
+            "MT planned": round(sum(c.total_mt for c in camps_prio), 1),
+        })
+        plan_compare_rows.append({
+            "Mill": mill,
+            "Plan": "Alternate (min changes)",
+            "Roll changes": nc_alt,
+            "Downtime (min)": dt_alt,
+            "MT planned": round(sum(c.total_mt for c in camps_alt), 1),
+        })
 
-            plan_choice = st.radio(
-                "Which plan to run?",
-                ["⚡ Priority Plan — follow consumer urgency exactly",
-                 f"🔩 Alternate Plan — save {alt['savings_min']} min, slight reorder"],
-                index=0, key="c2_plan_choice")
-            use_alt = plan_choice.startswith("🔩")
+    # Comparison table
+    st.markdown("#### Plan Comparison — Priority vs Alternate")
+    st.dataframe(pd.DataFrame(plan_compare_rows),
+                 use_container_width=True, hide_index=True)
+
+    # Per-mill plan choice
+    plan_choice = {}
+    for mill in ("CRM04", "CRM06"):
+        d = camp_data[mill]
+        savings = d["dt_prio"] - d["dt_alt"]
+        if savings > 0:
+            choices = [
+                f"⚡ Priority Plan — {d['nc_prio']} change(s), {d['dt_prio']} min downtime",
+                f"🔩 Alternate Plan — {d['nc_alt']} change(s), {d['dt_alt']} min downtime, saves {savings} min",
+            ]
+            choice = st.radio(f"**{mill} — which sequence?**", choices,
+                              key=f"choice_{mill}", index=0)
+            plan_choice[mill] = "alt" if "Alternate" in choice else "prio"
         else:
-            st.success(
-                f"✅ Priority Plan already roll-optimal — "
-                f"{prio['total_changes']} change(s), "
-                f"{prio['downtime_min']} min downtime. No alternate needed.")
-            use_alt = False
+            st.success(f"✅ {mill}: Priority order already minimises roll changes "
+                       f"({d['nc_prio']} change(s))")
+            plan_choice[mill] = "prio"
 
-        chosen = alt if (use_alt and alt) else prio
-        plan_name = "Alternate Plan" if (use_alt and alt) else "Priority Plan"
-
-        # ── Full coil table per mill with roll-change marker rows ─────────
-        for mill, current_roll in (("CRM04", rt04), ("CRM06", rt06)):
-            ordered  = chosen[mill]
-            n_chg    = chosen["changes04"] if mill == "CRM04" else chosen["changes06"]
-            n_coils  = sum(len(s["coils_df"]) for s in ordered)
-            tot_mt   = sum(float(s["coils_df"]["Input Coil Weight"].sum())
-                           for s in ordered)
-            st.markdown(
-                f"**🏭 {mill} · {plan_name}** — {len(ordered)} sections · "
-                f"{n_coils} coils · {tot_mt:.1f} MT · {n_chg} roll change(s) · "
-                f"{n_chg * PA_CHANGE_MIN} min downtime")
-
-            rows, roll, seq = [], current_roll, 0
-            for s in ordered:
-                needed = PA_SEC_TO_ROLL.get(s["section_key"], "Light Matt")
-                if needed != roll:
-                    rows.append({"Seq": "🔄", "Coil Number":
-                        f"ROLL CHANGE · {roll} → {needed} · {PA_CHANGE_MIN} min",
-                        "Section": "", "Roll Type": "", "Width": "",
-                        "Thick": "", "RT": "", "MT": "", "Customer": "",
-                        "Age": "", "Consumer": ""})
-                    roll = needed
-                sec_mt = float(s["coils_df"]["Input Coil Weight"].sum())
-                rows.append({"Seq": "", "Coil Number":
-                    f"═══ {s['section_key'].replace('_',' ').title()} ═══",
-                    "Section": "", "Roll Type": needed, "Width": "",
-                    "Thick": "", "RT": "", "MT": round(sec_mt, 1),
-                    "Customer": "",
-                    "Age": "", "Consumer":
-                        CONFIG["section_to_consumer"].get(s["section_key"], "")})
-                for _, r in s["coils_df"].iterrows():
-                    seq += 1
-                    rows.append({
-                        "Seq": seq,
-                        "Coil Number": str(r.get("Coil Number", "")),
-                        "Section": s["section_key"],
-                        "Roll Type": needed,
-                        "Width": float(r.get("Actual Width", 0) or 0),
-                        "Thick": float(r.get("Actual Thick", 0) or 0),
-                        "RT": float(r.get("Plan Rolling Thick 1", 0) or 0),
-                        "MT": round(float(r.get("Input Coil Weight", 0) or 0), 3),
-                        "Customer": str(r.get("Customer Desc", ""))[:18],
-                        "Age": float(r.get("Coil Age(# Days)", 0) or 0),
-                        "Consumer": CONFIG["section_to_consumer"].get(
-                            s["section_key"], ""),
-                    })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                         hide_index=True, height=320)
-
-        # ── Downloads — Excel matches standard plan format (write_sheet) ──
-        def _plan_xlsx(order04, order06):
-            from openpyxl import Workbook
-            from generator import write_sheet
-            wb = Workbook(); wb.remove(wb.active)
-            write_sheet(wb, date.today(), order04 + order06, load_db())
-            buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-            return buf.getvalue()
-
-        dcol1, dcol2, dcol3 = st.columns(3)
-        dcol1.download_button(
-            "⬇️ Priority Plan — Excel",
-            data=_plan_xlsx(prio["CRM04"], prio["CRM06"]),
-            file_name=f"mill_plan_priority_{date.today().strftime('%d-%m-%Y')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, key="dl_c2_prio")
-        if alt:
-            dcol2.download_button(
-                "⬇️ Alternate Plan — Excel",
-                data=_plan_xlsx(alt["CRM04"], alt["CRM06"]),
-                file_name=f"mill_plan_alternate_{date.today().strftime('%d-%m-%Y')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True, key="dl_c2_alt")
-        csv_rows = []
-        for mill, current_roll in (("CRM04", rt04), ("CRM06", rt06)):
-            roll = current_roll
-            for s in chosen[mill]:
-                needed = PA_SEC_TO_ROLL.get(s["section_key"], "Light Matt")
-                if needed != roll:
-                    csv_rows.append({"Mill": mill,
-                        "Coil": f"ROLL CHANGE {roll}->{needed} {PA_CHANGE_MIN}min"})
-                    roll = needed
-                for _, r in s["coils_df"].iterrows():
-                    csv_rows.append({
-                        "Mill": mill, "Coil": str(r.get("Coil Number","")),
-                        "Section": s["section_key"], "Roll": needed,
-                        "Width": r.get("Actual Width",""),
-                        "Thick": r.get("Actual Thick",""),
-                        "RT": r.get("Plan Rolling Thick 1",""),
-                        "MT": r.get("Input Coil Weight",""),
-                        "Customer": str(r.get("Customer Desc",""))[:18]})
-        dcol3.download_button(
-            f"⬇️ {plan_name} — CSV",
-            data=pd.DataFrame(csv_rows).to_csv(index=False),
-            file_name="mill_plan_priority_synced.csv", mime="text/csv",
-            use_container_width=True, key="dl_c2_csv")
+    # Show chosen campaigns per mill
+    for mill in ("CRM04", "CRM06"):
+        d       = camp_data[mill]
+        use_key = plan_choice.get(mill, "prio")
+        camps   = d[use_key]
+        defer   = d[f"defer_{use_key}"]
+        st.markdown(f"**🏭 {mill} — {'Priority' if use_key=='prio' else 'Alternate'} Plan**")
+        for i, camp in enumerate(camps, 1):
+            if camp.preceded_by_change:
+                st.markdown(
+                    f"🔄 **ROLL CHANGE: {camp.change_from} → {camp.roll_type}** "
+                    f"({CONFIG['roll_change_min']} min)")
+            life_used_pct = int(camp.mt_used_end / camp.roll_life * 100
+                                ) if camp.roll_life else 0
+            warn = " ⚠️ Exceeds roll life!" if camp.exceeds_life else ""
+            with st.expander(
+                    f"Campaign {i}: {camp.roll_type} — "
+                    f"{camp.n_coils} coils · {camp.total_mt:.1f}MT{warn}",
+                    expanded=(i == 1)):
+                st.progress(min(life_used_pct, 100),
+                            text=f"Roll life: {camp.mt_used_start:.0f}MT start → "
+                                 f"{camp.mt_used_end:.0f}MT end / {camp.roll_life}MT max")
+                camp_rows = [{"Seq": j+1, "Coil": c["coil"],
+                              "Width": c["width"], "Thick": c["thick"],
+                              "RT": c["rt"], "MT": c["mt"],
+                              "Customer": c["customer"], "Age(d)": c["age"]}
+                             for j, c in enumerate(camp.coils)]
+                st.dataframe(pd.DataFrame(camp_rows),
+                             use_container_width=True, hide_index=True)
+        if defer:
+            st.info("⏭️ Deferred (beyond shift capacity): " + " · ".join(defer))
 
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════
     # D — CRS SEQUENCE OPTIMISER
     # ══════════════════════════════════════════════════════════════════════
-    st.subheader("🔧 D — CRS Setting Change Optimiser")
-    urgency_aware = st.checkbox("Urgency-aware (run aged coils first even if slight extra cost)",
-                                value=True, key="crs_urgency")
-    crs = optimise_crs_sequence(secs, urgency_aware=urgency_aware,
-                                rolled_coils=rolled)
+    st.subheader("🔧 D — CRS Sequence Optimiser")
+    crs = optimise_crs(selected_sections, rolled_coils=rolled)
     if "error" in crs:
         st.info(crs["error"])
     else:
         xc1, xc2, xc3 = st.columns(3)
-        xc1.metric("CRS coils remaining", crs["total_coils"])
+        xc1.metric("CRS coils",         crs["total_coils"])
         xc2.metric("Changes (original)", crs["original_changes"])
-        xc3.metric("Changes (optimised)", crs["optimised_changes"],
-                   delta=f"-{crs['changes_saved']}",
-                   delta_color="inverse" if crs["changes_saved"] > 0 else "off")
+        xc3.metric("Changes (optimised)",crs["optimised_changes"],
+                   delta=f"-{crs['saved']}" if crs["saved"] else "0",
+                   delta_color="inverse" if crs["saved"] > 0 else "off")
         for r in crs["recommendations"]:
             (st.success if r.startswith("✅") else st.warning)(r)
-
         with st.expander("CRS sequence detail"):
-            rows = []
-            for i, c in enumerate(crs["optimised_sequence"], 1):
-                ev  = next((e for e in crs["change_events"] if e["position"] == i-1), None)
-                rows.append({
-                    "Pos": i, "Coil": c["coil_number"],
+            crs_rows = []
+            for i, c in enumerate(crs["optimised"], 1):
+                ev = next((e for e in crs["change_events"]
+                           if e["position"] == i-1), None)
+                crs_rows.append({"Pos": i, "Coil": c["coil_number"],
                     "Width": c["width"], "Thick": c["thick"],
-                    "MT": round(c["weight"], 3), "Customer": c["customer"][:15],
+                    "MT": round(c["weight"],3), "Customer": c["customer"][:15],
                     "Age(d)": c["age"],
-                    "⚠️ Change": " | ".join(ev["changes"]) if ev else "",
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    "⚠️ Change": " | ".join(ev["changes"]) if ev else ""})
+            st.dataframe(pd.DataFrame(crs_rows),
+                         use_container_width=True, hide_index=True)
             st.download_button("⬇️ CRS sequence CSV",
-                data=pd.DataFrame(rows).to_csv(index=False),
+                data=pd.DataFrame(crs_rows).to_csv(index=False),
                 file_name="crs_sequence.csv", mime="text/csv",
-                use_container_width=True, key="dl_crs_v3")
+                use_container_width=True, key="dl_crs")
 
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════
-    # E — DOWNLOAD ROLLING SHEET
+    # E — COIL TICK-OFF
     # ══════════════════════════════════════════════════════════════════════
-    st.subheader("📄 E — Download Rolling Sheets")
-    dl1, dl2 = st.columns(2)
-    for col, mill in [(dl1,"CRM04"),(dl2,"CRM06")]:
-        rows = []
-        for item in sheets[mill]:
-            if item["type"] == "header":
-                rows.append({"Seq":"","Coil":f"=== {item['section']} ===",
-                             "Width":"","Thick":"","RT":"","MT":item["total_mt"],
-                             "Customer":"","Remark":"","Rolled":""})
-            else:
-                rows.append({"Seq":item["seq"],"Coil":item["coil"],
-                             "Width":item["width"],"Thick":item["thick"],
-                             "RT":item["rt"],"MT":item["weight"],
-                             "Customer":item["customer"],"Remark":item["remark"],
-                             "Rolled":"YES" if item["rolled"] else ""})
-        col.download_button(f"⬇️ {mill} Rolling Sheet",
-            data=pd.DataFrame(rows).to_csv(index=False),
-            file_name=f"rolling_sheet_{mill}.csv", mime="text/csv",
-            use_container_width=True, key=f"dl_{mill}_v3")
+    st.subheader("✅ E — Coil Confirmation (mark as rolled)")
+    tot_coils  = sum(s.n_coils for s in selected_sections)
+    done_coils = len(rolled)
+    st.progress(done_coils / max(tot_coils, 1),
+                text=f"Rolled: {done_coils}/{tot_coils} coils")
+    if rolled:
+        if st.button("🗑️ Clear rolled coils", key="clr"):
+            st.session_state.pa_rolled = set()
+            st.rerun()
 
+    for mill in ("CRM04","CRM06"):
+        st.markdown(f"**🏭 {mill}**")
+        for s in sorted([s for s in selected_sections if s.mill==mill],
+                        key=lambda x: x.priority_rank):
+            st.caption(f"{s.section_key.replace('_',' ').title()} "
+                       f"[{s.roll_type}] → {s.consumer}")
+            for _, row in s.coils_df.iterrows():
+                cn = str(row.get("Coil Number",""))
+                if cn in rolled:
+                    st.markdown(f"~~{cn}~~ ✅  "
+                                f"W={row.get('Actual Width',0):.0f} "
+                                f"T={row.get('Actual Thick',0):.2f} "
+                                f"{row.get('Input Coil Weight',0):.3f}MT")
+                else:
+                    age = float(row.get("Coil Age(# Days)",0) or 0)
+                    af  = "🔴" if age>21 else "🟡" if age>14 else ""
+                    c1, c2 = st.columns([5,1])
+                    c1.markdown(
+                        f"{af} **{cn}** "
+                        f"W={row.get('Actual Width',0):.0f}mm "
+                        f"T={row.get('Actual Thick',0):.2f}→"
+                        f"{row.get('Plan Rolling Thick 1',0):.2f}mm "
+                        f"{row.get('Input Coil Weight',0):.3f}MT "
+                        f"*{str(row.get('Customer Desc',''))[:15]}* "
+                        f"Age:{age:.0f}d")
+                    if c2.button("✅", key=f"roll_{mill}_{cn}"):
+                        st.session_state.pa_rolled.add(cn)
+                        st.rerun()
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # F — ROLLING SHEET DOWNLOAD (standard Tata Steel format)
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("📄 F — Download Rolling Sheet")
+    st.caption("Excel with CRM-04 and CRM-06 on separate sheets, "
+               "matching standard plan format.")
+
+    def _build_excel(plan_choice_map):
+        from openpyxl import Workbook
+        from generator import write_sheet
+        # Build ordered section list per the chosen plan
+        ordered_all = []
+        for mill in ("CRM04","CRM06"):
+            d       = camp_data[mill]
+            use_key = plan_choice_map.get(mill, "prio")
+            camps   = d[use_key]
+            # Flatten campaign coils back to section order
+            sk_seen = []
+            for camp in camps:
+                for sk in camp.sections:
+                    if sk not in sk_seen:
+                        sk_seen.append(sk)
+            mill_sec_map = {s.section_key: s for s in selected_sections
+                            if s.mill == mill}
+            for sk in sk_seen:
+                if sk in mill_sec_map:
+                    # Reconstruct section dict for write_sheet
+                    s = mill_sec_map[sk]
+                    ordered_all.append({
+                        "section_key": sk,
+                        "mill": mill,
+                        "label": s.label,
+                        "coils_df": s.coils_df,
+                    })
+        wb = Workbook(); wb.remove(wb.active)
+        n, ws = write_sheet(wb, _date.today(), ordered_all, load_db())
+        buf = _io.BytesIO(); wb.save(buf); buf.seek(0)
+        return buf.getvalue()
+
+    dc1, dc2 = st.columns(2)
+    dc1.download_button(
+        "⬇️ Download Rolling Sheet (chosen plan)",
+        data=_build_excel(plan_choice),
+        file_name=f"rolling_sheet_{_date.today().strftime('%d-%m-%Y')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True, key="dl_sheet")
+
+    # Forecast
+    with st.expander("📉 7-Day Consumer Buffer Forecast"):
+        fc = forecast_depletion(raw_df, selected_sections, cons_ovr)
+        proj = []
+        for cname, r in fc.items():
+            for p in r["projection"]:
+                proj.append({"Date": p["date"], "Consumer": cname,
+                             "Buffer MT": p["buffer_mt"]})
+        if proj:
+            pivot = pd.DataFrame(proj).pivot(index="Date",
+                columns="Consumer", values="Buffer MT")
+            st.line_chart(pivot)
+            st.caption("Lines hitting zero = starvation on that date")
