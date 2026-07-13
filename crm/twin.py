@@ -60,12 +60,22 @@ def simulate(
     dates = [str(today + timedelta(days=d)) for d in range(horizon + 1)]
 
     # ── Starting WIP per (consumer, stage) ─────────────────────────────────
+    # FIX 5/6: CRS buffer uses in_scope_crs filter (RNM6/R032/R033 only)
     wip: Dict[str, Dict[str, float]] = {}
     for cons in C.CONSUMERS:
         wip[cons] = {}
         for stg in set(sum(CHAIN.values(), [])):
-            wip[cons][stg] = float(
-                df[(df["consumer"] == cons) & (df["stage"] == stg)]["mt"].sum())
+            if stg == "C R SLITTER":
+                if "in_scope_crs" in df.columns:
+                    mt = float(df[df["in_scope_crs"] &
+                                   (df["consumer"] == cons)]["mt"].sum())
+                else:
+                    mt = float(df[(df["consumer"]==cons) &
+                                  (df["stage"]==stg)]["mt"].sum())
+            else:
+                mt = float(df[(df["consumer"]==cons) &
+                               (df["stage"]==stg)]["mt"].sum())
+            wip[cons][stg] = mt
 
     # H&T buffer lives at FURNACE; TUBE/OEM at C R SLITTER
     def buffer_of(cons: str) -> float:
