@@ -7,6 +7,14 @@ from __future__ import annotations
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSUMERS — downstream demand destinations
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# CR SLITTER SCOPE FILTER  (Requirements 1 & 5)
+# Only these storage locations belong to our planning scope.
+# RC14, RC11, NC14, R027 etc. are outside scope.
+# ══════════════════════════════════════════════════════════════════════════════
+CRS_SCOPE_LOCATIONS = {"RNM6", "R032", "R033"}
+
+
 CONSUMERS = {
     "TUBE": {
         "label": "Tube Plant", "daily_mt": 210.0, "icon": "🔵",
