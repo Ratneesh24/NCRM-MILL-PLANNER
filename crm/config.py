@@ -37,13 +37,11 @@ CONSUMERS = {
 # PIPELINE STAGES — ordered, with nominal daily throughput & lead time
 # ══════════════════════════════════════════════════════════════════════════════
 STAGES = {
-    "PICKLING":             {"order": 1,  "label": "Pickling",      "cap_mt": 250, "lead_days": 1},
-    "HR SLITTER":           {"order": 2,  "label": "HR Slitter",    "cap_mt": 150, "lead_days": 1},
     "ROLLING MILL":         {"order": 3,  "label": "Rolling Mill",  "cap_mt": 290, "lead_days": 1},
-    "ANB":                  {"order": 4,  "label": "ANB (Anneal Base)", "cap_mt": 200, "lead_days": 3},
-    "ANNEALING":            {"order": 5,  "label": "Annealing",     "cap_mt": 200, "lead_days": 3},
-    "FURNACE":              {"order": 6,  "label": "H&T Furnace",   "cap_mt": 40,  "lead_days": 2.5},
-    "SPM":                  {"order": 7,  "label": "Skin Pass",     "cap_mt": 80,  "lead_days": 1},
+    "ANB":                  {"order": 4,  "label": "ANB (Anneal Base)", "cap_mt": 95, "lead_days": 3},
+    "ANNEALING":            {"order": 5,  "label": "Annealing",     "cap_mt": 270, "lead_days": 3},
+    "FURNACE":              {"order": 6,  "label": "H&T Furnace",   "cap_mt": 35,  "lead_days": 2.5},
+    "SPM":                  {"order": 7,  "label": "Skin Pass",     "cap_mt": 60,  "lead_days": 1},
     "REWINDING":            {"order": 8,  "label": "Rewinding",     "cap_mt": 120, "lead_days": 1},
     "C R SLITTER":          {"order": 9,  "label": "CR Slitter",    "cap_mt": 260, "lead_days": 1},
     "PACK":                 {"order": 15, "label": "Packing",       "cap_mt": 200, "lead_days": 0.5},
@@ -53,7 +51,7 @@ STAGES = {
 
 # The stages the planner actively monitors (per Mill Planning Guidelines §1)
 CORE_STAGES = ["C R SLITTER", "ROLLING MILL", "ANNEALING", "ANB",
-               "REWINDING", "FURNACE", "PICKLING", "SPM"]
+               "REWINDING", "FURNACE", "SPM"]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION → CONSUMER / ROLL / CAPACITY-TYPE
