@@ -59,12 +59,23 @@ def load_pipeline(path_or_buf) -> pd.DataFrame:
                      ("Yield Strength",    "ys")]:
         df[dst] = pd.to_numeric(df.get(src, 0), errors="coerce").fillna(0.0)
 
-    df["stage"]    = df.get("Current Stage", "").astype(str).str.strip()
-    df["next"]     = df.get("Next Stage", "").astype(str).str.strip()
-    df["customer"] = df.get("Customer Desc", "").astype(str).str.strip()
-    df["coil"]     = df.get("Coil Number", "").astype(str).str.strip()
-    df["quality"]  = df.get("Actual Quality", "").astype(str).str.strip()
-    df["product"]  = df.get("Product Code", "").astype(str).str.strip()
+    # FIX 2 — drop NaN rows (first row is blank in some exports)
+    df.dropna(subset=["Coil Number"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    df["stage"]    = df["Current Stage"].astype(str).str.strip()
+    df["next"]     = df.get("Next Stage", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+    df["customer"] = df.get("Customer Desc", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+    df["coil"]     = df["Coil Number"].astype(str).str.strip()
+    df["quality"]  = df.get("Actual Quality", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+    df["product"]  = df.get("Product Code", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+    df["storage"]  = df.get("Storage Location", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+
+    # FIX 1 — mark CRS coils that are in planning scope (storage RNM6/R032/R033)
+    df["in_scope_crs"] = (
+        (df["stage"] == "C R SLITTER") &
+        (df["storage"].isin(C.CRS_SCOPE_LOCATIONS))
+    )
 
     # Consumer
     df["consumer"] = df.apply(classify_consumer, axis=1)
@@ -110,8 +121,22 @@ def _quality_risk(row):
 # ══════════════════════════════════════════════════════════════════════════════
 def stage_breakup(df: pd.DataFrame,
                   stages: Optional[List[str]] = None) -> pd.DataFrame:
-    """Stage × Consumer inventory matrix with totals."""
-    d = df[df["stage"].isin(stages)] if stages else df
+    """Stage × Consumer inventory matrix with totals.
+    For C R SLITTER, only counts in-scope storage locations (RNM6/R032/R033).
+    """
+    if stages:
+        # For non-CRS stages: normal filter
+        # For CRS: apply scope filter
+        non_crs = df[(df["stage"].isin(stages)) & (df["stage"] != "C R SLITTER")]
+        crs_in  = df[df["in_scope_crs"]] if "in_scope_crs" in df.columns else                   df[df["stage"] == "C R SLITTER"]
+        if "C R SLITTER" in stages:
+            d = pd.concat([non_crs, crs_in])
+        else:
+            d = non_crs
+    else:
+        non_crs = df[df["stage"] != "C R SLITTER"]
+        crs_in  = df[df["in_scope_crs"]] if "in_scope_crs" in df.columns else                   df[df["stage"] == "C R SLITTER"]
+        d = pd.concat([non_crs, crs_in])
     piv = d.pivot_table(index="stage", columns="consumer",
                         values="mt", aggfunc="sum").fillna(0.0).round(1)
     for c in ("TUBE", "OEM", "H&T"):
@@ -127,10 +152,16 @@ def stage_breakup(df: pd.DataFrame,
 
 def customer_breakup(df: pd.DataFrame, consumer: str = "OEM",
                      stage: Optional[str] = None) -> pd.DataFrame:
-    """Customer-wise drill-down for a consumer (Guideline §1)."""
-    d = df[df["consumer"] == consumer]
-    if stage:
-        d = d[d["stage"] == stage]
+    """Customer-wise drill-down for a consumer (Guideline §1).
+    FIX 2: stage is now a clean string (NaN rows dropped in loader).
+    FIX 1: CRS stage uses in_scope_crs filter.
+    """
+    d = df[df["consumer"] == consumer].copy()
+    if stage and stage != "— all stages —":
+        if stage == "C R SLITTER" and "in_scope_crs" in d.columns:
+            d = d[d["in_scope_crs"]]
+        else:
+            d = d[d["stage"] == stage]
     out = (d.groupby("customer")
              .agg(coils=("coil", "count"), mt=("mt", "sum"),
                   avg_age=("coil_age", "mean"),
