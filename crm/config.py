@@ -46,11 +46,6 @@ STAGES = {
     "SPM":                  {"order": 7,  "label": "Skin Pass",     "cap_mt": 80,  "lead_days": 1},
     "REWINDING":            {"order": 8,  "label": "Rewinding",     "cap_mt": 120, "lead_days": 1},
     "C R SLITTER":          {"order": 9,  "label": "CR Slitter",    "cap_mt": 260, "lead_days": 1},
-    "GRINDING":             {"order": 10, "label": "Grinding",      "cap_mt": 60,  "lead_days": 1},
-    "EDGE ROUNDING":        {"order": 11, "label": "Edge Rounding", "cap_mt": 40,  "lead_days": 1},
-    "COLOR TEMPERING":      {"order": 12, "label": "Colour Temper", "cap_mt": 50,  "lead_days": 1},
-    "INSPECTION TABLE/CTL": {"order": 13, "label": "Inspection/CTL","cap_mt": 300, "lead_days": 1},
-    "PALLETIZATION":        {"order": 14, "label": "Palletization", "cap_mt": 200, "lead_days": 0.5},
     "PACK":                 {"order": 15, "label": "Packing",       "cap_mt": 200, "lead_days": 0.5},
     "PENDING FOR PLAN":     {"order": 0,  "label": "Pending Plan",  "cap_mt": 0,   "lead_days": 99},
     "NC":                   {"order": 0,  "label": "Non-Conforming","cap_mt": 0,   "lead_days": 99},
@@ -157,7 +152,7 @@ def age_band(days: float) -> str:
 SURFACE_CRITICAL   = {"BRIGHT", "MATT", "M"}     # surface-sensitive finishes
 TIGHT_TOL_UM       = 40                           # ≤40 µm band = thickness critical
 OEM_CRITICAL_CUST  = ["L.G BALAKRISHNAN", "SFC SOLUTIONS", "CALLIDA",
-                      "TMA INTERNATIONAL"]
+                      "TMA INTERNATIONAL","VAISH", "RUPH", "SK STEEL", "STEEL STRIPS", "KARAM", "INSAFE", "SMITH INDUSTRIAL CORPORATION"]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCORING WEIGHTS per planning mode (Guideline §2 + §3 + §4)
