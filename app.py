@@ -648,7 +648,8 @@ if page == "🏭 Pipeline Overview":
     d1, d2 = st.columns(2)
     sel_cons  = d1.selectbox("Consumer", ["TUBE", "OEM", "H&T"], index=1)
     sel_stage = d2.selectbox("Stage (optional)",
-                             ["— all stages —"] + sorted(df["stage"].unique()))
+        ["— all stages —"] +
+        sorted(df["stage"].dropna().astype(str).unique().tolist()))
     stg = None if sel_stage.startswith("—") else sel_stage
     cb  = PIPE.customer_breakup(df, sel_cons, stg)
     if cb.empty:
@@ -735,10 +736,33 @@ elif page == "🩺 Stage Health":
     if al:
         st.subheader("🚨 Alerts")
         for a in al:
-            if a.startswith("🔴"):   st.error(a)
-            elif a.startswith("🟠"): st.warning(a)
-            elif a.startswith("🟡"): st.warning(a)
-            else:                    st.info(a)
+            msg  = a["msg"]
+            lvl  = a["level"]
+            cdf  = a.get("coil_df")
+            if lvl == "CRITICAL":
+                st.error(msg)
+            elif lvl in ("ATTENTION", "STUCK"):
+                st.warning(msg)
+            else:
+                st.info(msg)
+            # FIX 4: show responsible coils under every alert
+            if cdf is not None and len(cdf) > 0:
+                with st.expander(f"🔍 View {len(cdf)} coil(s) responsible for this alert"):
+                    disp_cols = [c for c in
+                        ["coil","customer","consumer","mt","stage","storage",
+                         "coil_age","stage_age","thick","width","rt",
+                         "quality","qual_flags","age_band"]
+                        if c in cdf.columns]
+                    st.dataframe(
+                        cdf[disp_cols].rename(columns={
+                            "coil":"Coil","customer":"Customer",
+                            "consumer":"Consumer","mt":"MT (t)",
+                            "stage":"Stage","storage":"Storage",
+                            "coil_age":"Age(d)","stage_age":"Stage Age(d)",
+                            "thick":"Thick","width":"Width","rt":"RT",
+                            "quality":"Grade","qual_flags":"Quality Flags",
+                            "age_band":"Age Band"}),
+                        use_container_width=True, hide_index=True)
     else:
         st.success("✅ All stages and consumers healthy.")
 
@@ -846,7 +870,9 @@ elif page == "🎯 Plan Builder":
 
     # ── Alerts ────────────────────────────────────────────────────────────
     for a in R["alerts"][:5]:
-        (st.error if a.startswith("🔴") else st.warning)(a)
+        msg = a["msg"] if isinstance(a, dict) else a
+        (st.error if "CRITICAL" in (a.get("level","") if isinstance(a,dict) else msg)
+         else st.warning)(msg)
 
     # ── Consumer status strip ─────────────────────────────────────────────
     cc = st.columns(3)
