@@ -18,102 +18,125 @@ from . import config as C
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSUMER CLASSIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
-_H_STEP = re.compile(r"(^|[->\s(])H([->\s)]|&|$)", re.I)
-
-
-def classify_consumer(row) -> str:
-    """
-    TUBE : customer is Sahibabad Tube Plant
-    H&T  : process route contains an H (heat-treatment) step
-    OEM  : everything else
-    """
-    cust  = str(row.get("Customer Desc", "")).upper()
-    route = str(row.get("Process Route", "")).upper()
-    if "TUBE PLANT" in cust:
-        return "TUBE"
-    if "H&T" in route or _H_STEP.search(route):
-        return "H&T"
-    return "OEM"
+_H_STEP = re.compile(r"(?:^|[->\s(])H(?:[->\s)]|&|$)", re.I)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOADER
 # ══════════════════════════════════════════════════════════════════════════════
 def load_pipeline(path_or_buf) -> pd.DataFrame:
-    """Read WIP → normalise → enrich with consumer, ages, quality risk."""
+    """Read WIP → validate → normalise → enrich (vectorised).
+
+    Raises ValueError with a clear message when required columns are missing.
+    """
     df = pd.read_excel(path_or_buf)
     df.columns = df.columns.str.strip()
 
-    # Normalise weight to MT
-    df["mt"] = pd.to_numeric(df.get("Input Coil Weight", 0),
-                             errors="coerce").fillna(0.0)
+    # ── Validation: required columns ─────────────────────────────────────
+    required = ["Coil Number", "Current Stage", "Input Coil Weight"]
+    missing  = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"WIP file is missing required column(s): {', '.join(missing)}. "
+            f"Is this the correct coil-stage export?")
+
+    # ── FIX 2: drop blank/duplicate rows ─────────────────────────────────
+    df = df.dropna(subset=["Coil Number"]).reset_index(drop=True)
+    if df.empty:
+        raise ValueError("WIP file has no valid coil rows.")
+
+    # ── Normalise weight to MT ───────────────────────────────────────────
+    df["mt"] = pd.to_numeric(df["Input Coil Weight"], errors="coerce").fillna(0.0)
     df.loc[df["mt"] > 100, "mt"] /= 1000.0
 
-    # Numerics
-    for src, dst in [("Coil Age(# Days)",  "coil_age"),
-                     ("Stage Age(# Days)", "stage_age"),
-                     ("Order Age(# Days)", "order_age"),
-                     ("Actual Thick",      "thick"),
-                     ("Actual Width",      "width"),
-                     ("Plan Rolling Thick 1", "rt"),
-                     ("Yield Strength",    "ys")]:
-        df[dst] = pd.to_numeric(df.get(src, 0), errors="coerce").fillna(0.0)
+    # ── Numerics ─────────────────────────────────────────────────────────
+    for src_col, dst in [("Coil Age(# Days)",  "coil_age"),
+                         ("Stage Age(# Days)", "stage_age"),
+                         ("Order Age(# Days)", "order_age"),
+                         ("Actual Thick",      "thick"),
+                         ("Actual Width",      "width"),
+                         ("Plan Rolling Thick 1", "rt"),
+                         ("Yield Strength",    "ys")]:
+        df[dst] = pd.to_numeric(df.get(src_col, 0), errors="coerce").fillna(0.0)
 
-    # FIX 2 — drop NaN rows (first row is blank in some exports)
-    df.dropna(subset=["Coil Number"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    # ── Strings (vectorised, NaN-safe) ───────────────────────────────────
+    def _s(col):
+        return df.get(col, pd.Series("", index=df.index)) \
+                 .fillna("").astype(str).str.strip()
+    df["stage"]    = _s("Current Stage")
+    df["next"]     = _s("Next Stage")
+    df["customer"] = _s("Customer Desc")
+    df["coil"]     = _s("Coil Number")
+    df["quality"]  = _s("Actual Quality")
+    df["product"]  = _s("Product Code")
+    df["storage"]  = _s("Storage Location")
 
-    df["stage"]    = df["Current Stage"].astype(str).str.strip()
-    df["next"]     = df.get("Next Stage", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
-    df["customer"] = df.get("Customer Desc", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
-    df["coil"]     = df["Coil Number"].astype(str).str.strip()
-    df["quality"]  = df.get("Actual Quality", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
-    df["product"]  = df.get("Product Code", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
-    df["storage"]  = df.get("Storage Location", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
-
-    # FIX 1 — mark CRS coils that are in planning scope (storage RNM6/R032/R033)
+    # ── FIX 1: CRS planning-scope flag (storage RNM6/R032/R033) ─────────
     df["in_scope_crs"] = (
         (df["stage"] == "C R SLITTER") &
-        (df["storage"].isin(C.CRS_SCOPE_LOCATIONS))
-    )
+        (df["storage"].isin(C.CRS_SCOPE_LOCATIONS)))
 
-    # Consumer
-    df["consumer"] = df.apply(classify_consumer, axis=1)
+    # ── Consumer classification (vectorised) ─────────────────────────────
+    route_u = _s("Process Route").str.upper()
+    cust_u  = df["customer"].str.upper()
+    is_tube = cust_u.str.contains("TUBE PLANT", na=False)
+    is_ht   = route_u.str.contains("H&T", na=False) | \
+              route_u.str.contains(_H_STEP.pattern, regex=True, na=False)
+    df["consumer"] = "OEM"
+    df.loc[is_ht,   "consumer"] = "H&T"
+    df.loc[is_tube, "consumer"] = "TUBE"   # tube wins over H&T
 
-    # Aging band + quality risk
-    df["age_band"]   = df["coil_age"].apply(C.age_band)
-    df["age_score"]  = df["coil_age"].apply(C.age_score)
-    df["qual_risk"], df["qual_flags"] = zip(*df.apply(_quality_risk, axis=1))
+    # ── Aging band + score (vectorised via cut) ──────────────────────────
+    df["age_band"]  = df["coil_age"].apply(C.age_band)
+    df["age_score"] = df["coil_age"].apply(C.age_score)
 
-    # Stage order (for flow diagrams)
+    # ── Quality risk (vectorised) ─────────────────────────────────────────
+    surf_u = _s("Surface Finish").str.upper()
+    q      = pd.Series(0, index=df.index, dtype=int)
+    flags  = pd.Series([[] for _ in range(len(df))], index=df.index)
+
+    m = surf_u.isin(C.SURFACE_CRITICAL)
+    q  += m * 35
+    flags[m] = flags[m].apply(lambda l: l + ["Surface critical"])
+
+    tol = _s("Thickness Tolerance").str.extract(
+        r"([\d.]+)\s*-\s*([\d.]+)").astype(float)
+    band_um = (tol[1] - tol[0]) * 1000
+    m = (band_um > 0) & (band_um <= C.TIGHT_TOL_UM)
+    q  += m.fillna(False) * 35
+    flags[m.fillna(False)] = flags[m.fillna(False)].apply(
+        lambda l: l + ["Tight tolerance"])
+
+    crit_pat = "|".join(C.OEM_CRITICAL_CUST)
+    m = cust_u.str.contains(crit_pat, na=False, regex=True)
+    q  += m * 20
+    flags[m] = flags[m].apply(lambda l: l + ["OEM critical customer"])
+
+    m = df["ys"] > 400
+    q  += m * 10
+    flags[m] = flags[m].apply(lambda l: l + ["High yield strength"])
+
+    df["qual_risk"]  = q.clip(upper=100)
+    df["qual_flags"] = flags.apply(" · ".join)
+
+    # ── Stage order (for flow diagrams) ───────────────────────────────────
     df["stage_order"] = df["stage"].map(
         lambda s: C.STAGES.get(s, {}).get("order", 99))
 
     return df
 
 
-def _quality_risk(row):
-    """Quality criticality score 0-100 + list of reasons (Guideline §7)."""
-    score, flags = 0, []
-    surf = str(row.get("Surface Finish", "")).upper().strip()
-    if surf in C.SURFACE_CRITICAL:
-        score += 35; flags.append("Surface critical")
+def scoped(df: pd.DataFrame) -> pd.DataFrame:
+    """The planning-scope view of the WIP (Requirement 6 — consistency).
 
-    tol = str(row.get("Thickness Tolerance", ""))
-    m = re.match(r"([\d.]+)\s*-\s*([\d.]+)", tol)
-    if m:
-        band_um = (float(m.group(2)) - float(m.group(1))) * 1000
-        if 0 < band_um <= C.TIGHT_TOL_UM:
-            score += 35; flags.append(f"Tight tol ±{band_um/2:.0f}µm")
-
-    cust = str(row.get("Customer Desc", "")).upper()
-    if any(k in cust for k in C.OEM_CRITICAL_CUST):
-        score += 20; flags.append("OEM critical customer")
-
-    if float(row.get("ys", 0) or 0) > 400:
-        score += 10; flags.append("High yield strength")
-
-    return min(score, 100), " · ".join(flags)
+    Removes CRS coils whose storage location is outside RNM6/R032/R033.
+    Every module that aggregates 'the pipeline' should use this view so that
+    Pipeline Overview, Stage Health, Consumer Health, Digital Twin, Alerts
+    and Plan Builder all agree on the same numbers.
+    """
+    if "in_scope_crs" not in df.columns:
+        return df
+    return df[(df["stage"] != "C R SLITTER") | df["in_scope_crs"]]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -172,7 +195,9 @@ def customer_breakup(df: pd.DataFrame, consumer: str = "OEM",
 
 
 def aging_profile(df: pd.DataFrame) -> pd.DataFrame:
-    """WIP tonnage by age band × consumer (Guideline §3)."""
+    """WIP tonnage by age band × consumer (Guideline §3).
+    Uses the planning-scope view (out-of-scope CRS excluded)."""
+    df = scoped(df)
     order = [b[2] for b in C.AGE_BANDS]
     piv = df.pivot_table(index="age_band", columns="consumer",
                          values="mt", aggfunc="sum").fillna(0.0).round(1)
@@ -189,7 +214,8 @@ def flow_edges(df: pd.DataFrame, min_mt: float = 5.0) -> pd.DataFrame:
     Material movement edges (current stage → next stage) for Sankey.
     Guideline §9.
     """
-    d = df[(df["stage"] != "") & (df["next"] != "")]
+    d = scoped(df)
+    d = d[(d["stage"] != "") & (d["next"] != "")]
     e = (d.groupby(["stage", "next", "consumer"])
            .agg(mt=("mt", "sum"), coils=("coil", "count"))
            .reset_index())
@@ -200,7 +226,8 @@ def flow_edges(df: pd.DataFrame, min_mt: float = 5.0) -> pd.DataFrame:
 
 def stuck_wip(df: pd.DataFrame, days: int = 21) -> pd.DataFrame:
     """Coils sitting at one stage beyond `days` — inventory rotation risk."""
-    d = df[df["stage_age"] >= days].copy()
+    d = scoped(df)
+    d = d[d["stage_age"] >= days].copy()
     return (d.groupby(["stage", "consumer"])
               .agg(coils=("coil", "count"), mt=("mt", "sum"),
                    oldest=("stage_age", "max"))
