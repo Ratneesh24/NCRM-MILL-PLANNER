@@ -31,17 +31,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-def build_candidates(path: str, db: Optional[dict] = None
+def build_candidates(path: str, db: Optional[dict] = None,
+                     full: Optional[pd.DataFrame] = None,
                      ) -> Tuple[pd.DataFrame, List[Dict]]:
     """
     Run the validated Mill Planner routing, then enrich each section's
     coils with pipeline attributes (consumer, ages, quality risk).
+    Pass `full` (an already-loaded enriched frame) to skip re-reading
+    the Excel — halves planning latency in the UI.
     Returns (full_enriched_wip, sections)
     """
     from generator import (load_wip, filter_rolling_coils,
                            assign_all, build_sections)
 
-    full = P.load_pipeline(path)                    # enriched full pipeline
+    if full is None:
+        full = P.load_pipeline(path)                # enriched full pipeline
 
     wip      = load_wip(path)                      # validated loader
     eligible = filter_rolling_coils(wip)           # validated filters
@@ -100,12 +104,14 @@ def run_planning(
     demand:        Optional[Dict[str, float]] = None,
     db:            Optional[dict] = None,
     selected:      Optional[List[str]] = None,
+    full:          Optional[pd.DataFrame] = None,
 ) -> Dict:
     """
     Full planning run. Returns everything the UI needs.
     `selected` = optional list of section_keys the planner ticked.
+    `full`     = pre-loaded enriched WIP (skips one Excel read).
     """
-    full, sections = build_candidates(path, db)
+    full, sections = build_candidates(path, db, full=full)
 
     if selected is not None:
         sections = [s for s in sections if s["section_key"] in selected]
@@ -179,6 +185,10 @@ def export_excel(
                 ordered.append({"section_key": sk, "mill": mill,
                                 "label": s.label, "coils_df": df})
 
+    if not ordered:
+        raise ValueError(
+            "Nothing to export — no coils in the chosen campaigns. "
+            "Select at least one section with material within capacity.")
     wb = Workbook(); wb.remove(wb.active)
     write_sheet(wb, plan_date or date.today(), ordered, db)
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
