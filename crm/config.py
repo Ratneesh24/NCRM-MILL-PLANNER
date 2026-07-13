@@ -12,7 +12,7 @@ from __future__ import annotations
 # Only these storage locations belong to our planning scope.
 # RC14, RC11, NC14, R027 etc. are outside scope.
 # ══════════════════════════════════════════════════════════════════════════════
-CRS_SCOPE_LOCATIONS = {"RNM6", "R032", "R033"}
+CRS_SCOPE_LOCATIONS = {"RNM6", "R032", "R033", "RNM4", "R033", "R036", "R027"}
 
 
 CONSUMERS = {
