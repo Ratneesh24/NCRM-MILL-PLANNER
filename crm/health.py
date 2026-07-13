@@ -41,7 +41,8 @@ _ICON = {"CRITICAL": "🔴", "ATTENTION": "🟡",
          "HEALTHY": "🟢", "EXCESS": "🟠"}
 
 
-def _classify(days: float, target: float) -> str:
+def _classify(days: float) -> str:
+    """RAG status from days-of-cover against global thresholds."""
     if days < C.HEALTH["starved_days"]:    return "CRITICAL"
     if days < C.HEALTH["attention_days"]:  return "ATTENTION"
     if days > C.HEALTH["overload_days"]:   return "EXCESS"
@@ -79,8 +80,8 @@ def consumer_health(df: pd.DataFrame,
         inv    = round(float(d["mt"].sum()), 1)
         feed   = round(float(plan_feed.get(key, 0.0)), 1)
         total  = inv + feed
-        days   = round(total / rate, 2) if rate else 99.0
-        status = _classify(days, cfg["target_days"])
+        days   = round(total / rate, 2) if rate > 0 else 99.0
+        status = _classify(days)
 
         starve = None
         if days < 7:
@@ -121,11 +122,15 @@ def stage_health(df: pd.DataFrame,
     for s in stages:
         cfg  = C.STAGES.get(s, {"label": s, "cap_mt": 100, "order": 99})
         rate = float(cfg.get("cap_mt", 100)) or 1.0
-        d    = df[df["stage"] == s]
+        if s == "C R SLITTER" and "in_scope_crs" in df.columns:
+            # Consistency: CRS stage health uses planning-scope material only
+            d = df[df["in_scope_crs"]]
+        else:
+            d = df[df["stage"] == s]
 
         inv    = round(float(d["mt"].sum()), 1)
-        days   = round(inv / rate, 2)
-        status = _classify(days, 2.0)
+        days   = round(inv / rate, 2) if rate > 0 else 99.0
+        status = _classify(days)
 
         starve = str(today + timedelta(days=int(days))) if days < 7 else None
         short  = max(0.0, round(C.HEALTH["attention_days"] * rate - inv, 1))
