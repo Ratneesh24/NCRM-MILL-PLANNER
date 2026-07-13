@@ -33,6 +33,8 @@ class Health:
     avg_age:         float = 0.0
     stuck_coils:     int   = 0
     note:            str   = ""
+    # FIX 4: coil-level detail for alert drill-down
+    coil_detail:     Optional[object] = None  # pd.DataFrame slice
 
 
 _ICON = {"CRITICAL": "🔴", "ATTENTION": "🟡",
@@ -67,7 +69,12 @@ def consumer_health(df: pd.DataFrame,
     for key, cfg in C.CONSUMERS.items():
         rate = (overrides or {}).get(key, cfg["daily_mt"])
         buf_stage = "FURNACE" if key == "H&T" else "C R SLITTER"
-        d = df[(df["stage"] == buf_stage) & (df["consumer"] == key)]
+        if key == "H&T":
+            # H&T buffer = FURNACE, no storage filter
+            d = df[(df["stage"] == buf_stage) & (df["consumer"] == key)]
+        else:
+            # FIX 5: CRS buffer = only storage RNM6/R032/R033 (in_scope_crs)
+            d = df[df["in_scope_crs"] & (df["consumer"] == key)]
 
         inv    = round(float(d["mt"].sum()), 1)
         feed   = round(float(plan_feed.get(key, 0.0)), 1)
@@ -91,6 +98,7 @@ def consumer_health(df: pd.DataFrame,
             avg_age=round(float(d["coil_age"].mean()), 1) if len(d) else 0.0,
             stuck_coils=int((d["stage_age"] > 21).sum()),
             note=(f"Plan adds {feed:.0f} MT today" if feed else ""),
+            coil_detail=d.copy() if len(d) else None,
         )
     return out
 
@@ -131,6 +139,7 @@ def stage_health(df: pd.DataFrame,
             excess_mt=excess,
             avg_age=round(float(d["coil_age"].mean()), 1) if len(d) else 0.0,
             stuck_coils=int((d["stage_age"] > 21).sum()),
+            coil_detail=d.copy() if len(d) else None,
         )
     return out
 
@@ -152,27 +161,64 @@ def health_table(h: Dict[str, Health]) -> pd.DataFrame:
     } for x in h.values()])
 
 
+# ── Detail columns shown in alert drill-down ─────────────────────────────────
+ALERT_COIL_COLS = [
+    "coil", "customer", "consumer", "mt", "stage", "storage",
+    "coil_age", "stage_age", "thick", "width", "rt",
+    "quality", "qual_flags", "age_band",
+]
+
+
+def _coil_table(df, sort_col="coil_age") -> Optional["pd.DataFrame"]:
+    """Subset and sort coil detail for alert display."""
+    import pandas as pd
+    if df is None or len(df) == 0:
+        return None
+    cols = [c for c in ALERT_COIL_COLS if c in df.columns]
+    return (df[cols].sort_values(sort_col, ascending=False)
+              .round({"mt": 3, "coil_age": 0, "stage_age": 0,
+                      "thick": 2, "width": 0})
+              .reset_index(drop=True))
+
+
 def alerts(consumer_h: Dict[str, Health],
-           stage_h: Dict[str, Health]) -> List[str]:
-    """Ranked alert list for the planner."""
-    a: List[str] = []
+           stage_h:    Dict[str, Health]) -> List[dict]:
+    """
+    Ranked alert list. Each alert is a dict with:
+      msg       : human-readable alert string
+      level     : CRITICAL / ATTENTION / EXCESS / STUCK
+      coil_df   : pd.DataFrame of responsible coils (or None)
+    """
+    a: List[dict] = []
     for x in consumer_h.values():
+        coils_sorted = _coil_table(x.coil_detail)
         if x.status == "CRITICAL":
-            a.append(f"🔴 {x.label} CRITICAL — {x.days_cover:.1f}d cover, "
-                     f"starves {x.starvation_date}. "
-                     f"Roll {x.shortfall_mt:.0f} MT today.")
+            a.append({"level": "CRITICAL", "coil_df": coils_sorted,
+                "msg": (f"🔴 {x.label} CRITICAL — {x.days_cover:.1f}d cover, "
+                        f"starves {x.starvation_date}. "
+                        f"Roll {x.shortfall_mt:.0f} MT today.")})
         elif x.status == "ATTENTION":
-            a.append(f"🟡 {x.label} low — {x.days_cover:.1f}d cover. "
-                     f"Needs {x.shortfall_mt:.0f} MT.")
+            a.append({"level": "ATTENTION", "coil_df": coils_sorted,
+                "msg": (f"🟡 {x.label} low — {x.days_cover:.1f}d cover. "
+                        f"Needs {x.shortfall_mt:.0f} MT.")})
         elif x.status == "EXCESS":
-            a.append(f"🟠 {x.label} overloaded — {x.days_cover:.1f}d cover, "
-                     f"{x.excess_mt:.0f} MT excess. Ease off.")
+            a.append({"level": "EXCESS", "coil_df": coils_sorted,
+                "msg": (f"🟠 {x.label} overloaded — {x.days_cover:.1f}d cover, "
+                        f"{x.excess_mt:.0f} MT excess. Ease off.")})
+
     for x in stage_h.values():
+        coils_sorted = _coil_table(x.coil_detail)
         if x.status == "CRITICAL" and x.inventory_mt > 0:
-            a.append(f"🔴 {x.label} starving — only {x.days_cover:.1f}d WIP.")
+            a.append({"level": "CRITICAL", "coil_df": coils_sorted,
+                "msg": (f"🔴 {x.label} starving — only {x.days_cover:.1f}d WIP.")})
         elif x.status == "EXCESS":
-            a.append(f"🟠 {x.label} congested — {x.inventory_mt:.0f} MT "
-                     f"({x.days_cover:.1f}d). Bottleneck risk.")
+            a.append({"level": "EXCESS", "coil_df": coils_sorted,
+                "msg": (f"🟠 {x.label} congested — {x.inventory_mt:.0f} MT "
+                        f"({x.days_cover:.1f}d). Bottleneck risk.")})
         if x.stuck_coils >= 5:
-            a.append(f"⏰ {x.label}: {x.stuck_coils} coils stuck >21 days.")
+            stuck = _coil_table(
+                x.coil_detail[x.coil_detail["stage_age"] >= 21]
+                if x.coil_detail is not None else None)
+            a.append({"level": "STUCK", "coil_df": stuck,
+                "msg": (f"⏰ {x.label}: {x.stuck_coils} coils stuck >21 days.")})
     return a
