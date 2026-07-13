@@ -60,7 +60,7 @@ def simulate(
     dates = [str(today + timedelta(days=d)) for d in range(horizon + 1)]
 
     # ── Starting WIP per (consumer, stage) ─────────────────────────────────
-    # FIX 5/6: CRS buffer uses in_scope_crs filter (RNM6/R032/R033 only)
+    # FIX 5/6: CRS buffer uses in_scope_crs filter (RNM6/R032/R033/R036/RO27/RNM4 only)
     wip: Dict[str, Dict[str, float]] = {}
     for cons in C.CONSUMERS:
         wip[cons] = {}
