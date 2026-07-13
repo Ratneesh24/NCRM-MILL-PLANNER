@@ -10,7 +10,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date
 
 import streamlit as st
 
@@ -18,7 +18,6 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(__file__))
 
 from generator import generate_daily_plan
-from learner   import learn as learner_learn, calculate_accuracy
 from db        import load_db, save_db, is_supabase_connected, get_storage_mode
 from constants import SECTION_SHORT_NAME
 
@@ -83,9 +82,9 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["🏭 Pipeline Overview", "🩺 Stage Health",
-         "🎯 Plan Builder", "🔮 Digital Twin",
-         "🧠 Learn", "📊 Stats"],
+        ["📋 Generate Plan", "🏭 Pipeline Overview",
+         "🩺 Stage Health", "🎯 Plan Builder",
+         "🔮 Digital Twin", "🧠 Learn", "📊 Stats"],
         label_visibility="collapsed",
     )
 
@@ -128,7 +127,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE 1 — GENERATE
 # ══════════════════════════════════════════════════════════════════════════
-if page == "__LEGACY_GENERATE__":
+if page == "📋 Generate Plan":
     st.title("📋 Generate Mill Plan")
     st.caption("Upload the daily WIP coil staging export → get a formatted rolling plan.")
 
@@ -221,6 +220,152 @@ elif page == "🧠 Learn":
         "Upload the WIP file + generated plan + planner's corrected version. "
         "Routing rules AND the ML model update automatically in one step."
     )
+
+    # ══════════════════════════════════════════════════════════════════
+    # FIX 3 — TRAINING MODE: generate → correct inline → learn (no Excel)
+    # ══════════════════════════════════════════════════════════════════
+    with st.expander("🏋️ Training Mode — generate a plan and correct it "
+                     "here (no Excel editing needed)", expanded=False):
+        import pandas as pd
+
+        wip_train  = st.file_uploader("WIP file for training",
+                                      type=["xlsx"], key="wip_train")
+        train_date = st.date_input("Plan date ", value=date.today(),
+                                   key="train_date")
+
+        if wip_train and st.button("⚙️ Generate training plan",
+                                   type="primary", use_container_width=True,
+                                   key="gen_train_btn"):
+            with st.spinner("Generating plan…"):
+                try:
+                    wip_train.seek(0)
+                    with tempfile.NamedTemporaryFile(
+                            suffix=".xlsx", delete=False) as t:
+                        t.write(wip_train.read()); tp = t.name
+                    gen_out = tp.replace(".xlsx", "_gen.xlsx")
+                    import contextlib, io as _io
+                    with contextlib.redirect_stdout(_io.StringIO()):
+                        res = generate_daily_plan(
+                            wip_file=tp,
+                            plan_date=train_date.strftime("%Y-%m-%d"),
+                            output_file=gen_out,
+                            days=1, learning_db=load_db(), verbose=False)
+                    st.session_state.train_res      = res
+                    st.session_state.train_gen_path = gen_out
+                    st.session_state.train_wip_path = tp
+                    st.session_state.pop("train_editor_df", None)
+                    st.success(
+                        f"Plan generated — {res['eligible_count']} coils in "
+                        f"{len(res['sections'])} sections. Correct below.")
+                except Exception as e:
+                    st.error(f"Generation failed: {e}")
+
+        if "train_res" in st.session_state:
+            res       = st.session_state.train_res
+            sec_opts  = list(SECTION_SHORT_NAME.keys())
+            mill_opts = ["CRM04", "CRM06"]
+
+            if "train_editor_df" not in st.session_state:
+                rows = []
+                for s in res["sections"]:
+                    for _, r in s["coils_df"].iterrows():
+                        rows.append({
+                            "Coil":     str(r.get("Coil Number", "")),
+                            "Width":    r.get("Actual Width", ""),
+                            "Thick":    r.get("Actual Thick", ""),
+                            "RT":       r.get("Plan Rolling Thick 1", ""),
+                            "MT":       round(float(
+                                r.get("Input Coil Weight", 0) or 0), 3),
+                            "Quality":  r.get("Actual Quality", ""),
+                            "Customer": str(r.get("Customer Desc", ""))[:20],
+                            "Section":  s["section_key"],
+                            "Mill":     s["mill"],
+                        })
+                st.session_state.train_editor_df = pd.DataFrame(rows)
+
+            st.markdown("**Edit the Section / Mill cells to correct routing:**")
+            edited = st.data_editor(
+                st.session_state.train_editor_df,
+                use_container_width=True, hide_index=True, height=400,
+                column_config={
+                    "Section": st.column_config.SelectboxColumn(
+                        "Section", options=sec_opts, required=True),
+                    "Mill": st.column_config.SelectboxColumn(
+                        "Mill", options=mill_opts, required=True),
+                },
+                disabled=["Coil", "Width", "Thick", "RT", "MT",
+                          "Quality", "Customer"],
+                key="train_editor")
+
+            base    = st.session_state.train_editor_df
+            changed = edited[(edited["Section"] != base["Section"]) |
+                             (edited["Mill"]    != base["Mill"])]
+            st.info(f"✏️ {len(changed)} coil(s) corrected.")
+
+            if len(changed) and st.button(
+                    "🧠 Run Learning Session with these corrections",
+                    type="primary", use_container_width=True,
+                    key="train_learn_btn"):
+                with st.spinner("Building corrected plan and retraining…"):
+                    try:
+                        from openpyxl import Workbook as _WB
+                        from generator import write_sheet as _ws
+                        from learner import (diff_plans, extract_and_update,
+                                             calculate_accuracy,
+                                             build_session_entry)
+                        # 1. Sections with the planner's corrections applied
+                        corr = {str(r["Coil"]): (r["Section"], r["Mill"])
+                                for _, r in edited.iterrows()}
+                        bucket: dict = {}
+                        for s in res["sections"]:
+                            for _, r in s["coils_df"].iterrows():
+                                cn = str(r.get("Coil Number", ""))
+                                sec, mill = corr.get(
+                                    cn, (s["section_key"], s["mill"]))
+                                bucket.setdefault((sec, mill), []).append(r)
+                        corrected = [
+                            {"section_key": k[0], "mill": k[1],
+                             "label": k[0].replace("_", " ").title(),
+                             "coils_df": pd.DataFrame(v)}
+                            for k, v in bucket.items()]
+
+                        # 2. Corrected plan in the standard format
+                        act_out = st.session_state.train_wip_path.replace(
+                            ".xlsx", "_corrected.xlsx")
+                        wb = _WB(); wb.remove(wb.active)
+                        _ws(wb, train_date, corrected, load_db())
+                        wb.save(act_out)
+
+                        # 3. Standard learning pipeline
+                        clog, gplan, aplan = diff_plans(
+                            st.session_state.train_gen_path,
+                            act_out, train_date)
+                        cur   = load_db()
+                        n_act = sum(len(x["coils"])
+                                    for x in aplan["sections"])
+                        added, reinf, confl = extract_and_update(
+                            clog, cur, gplan, aplan)
+                        acc = calculate_accuracy(clog, n_act)
+                        cur["session_log"].append(build_session_entry(
+                            train_date, gplan, aplan, clog, acc,
+                            added, reinf, confl))
+                        ns   = cur.get("total_sessions", 0) + 1
+                        prev = cur.get("cumulative_accuracy", 0.0)
+                        cur["cumulative_accuracy"] = round(
+                            (prev * (ns - 1) +
+                             acc["overall_accuracy"]) / ns, 4)
+                        cur["total_sessions"] = ns
+                        save_db(cur)
+                        st.success(
+                            f"✅ Learned from {len(changed)} correction(s) — "
+                            f"{added} rule(s) added, {reinf} reinforced. "
+                            f"Accuracy {acc['overall_accuracy']*100:.1f}%.")
+                    except Exception as e:
+                        st.error(f"Learning failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+    st.divider()
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -562,9 +707,17 @@ elif page == "📊 Stats":
     st.caption("2 minutes a day. After 30 days these replace the assumed "
                "consumption numbers with measured reality.")
 
-    from outcome_logger import save_outcome, load_outcomes
+    try:
+        from outcome_logger import save_outcome, load_outcomes
+        _outlog_ok = True
+    except ImportError:
+        _outlog_ok = False
+        st.warning("⚠️ outcome_logger.py not found in the repo — "
+                   "outcome logging disabled. Add the file to enable it.")
     import pandas as _olpd
 
+    if not _outlog_ok:
+        st.stop()
     with st.form("stats_outcome_form"):
         oc1, oc2, oc3 = st.columns(3)
         ol_date  = oc1.date_input("Date", value=_olpd.Timestamp.now().date())
@@ -612,7 +765,7 @@ elif page == "📊 Stats":
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE — 🏭 PIPELINE OVERVIEW   (Guideline §1, §3, §9)
 # ══════════════════════════════════════════════════════════════════════════════
-if page == "🏭 Pipeline Overview":
+elif page == "🏭 Pipeline Overview":
     import pandas as pd
     st.title("🏭 Pipeline Overview")
     st.caption("Stage-wise WIP with Tube / OEM / H&T drill-down · "
@@ -620,11 +773,15 @@ if page == "🏭 Pipeline Overview":
 
     _, df = wip_gate("wip_pipe")
 
-    # ── Headline ──────────────────────────────────────────────────────────
+    # ── Headline (planning scope — out-of-scope CRS excluded) ────────────
+    dfs = PIPE.scoped(df)
+    excl = len(df) - len(dfs)
     m = st.columns(4)
-    m[0].metric("Total WIP", f"{df['mt'].sum():,.0f} MT", f"{len(df)} coils")
+    m[0].metric("Total WIP (in scope)", f"{dfs['mt'].sum():,.0f} MT",
+                f"{len(dfs)} coils" +
+                (f" · {excl} CRS coils out of scope" if excl else ""))
     for i, cons in enumerate(("TUBE", "OEM", "H&T"), start=1):
-        d = df[df["consumer"] == cons]
+        d = dfs[dfs["consumer"] == cons]
         cfg = C.CONSUMERS[cons]
         m[i].metric(f"{cfg['icon']} {cfg['label']}",
                     f"{d['mt'].sum():,.0f} MT",
@@ -649,7 +806,8 @@ if page == "🏭 Pipeline Overview":
     sel_cons  = d1.selectbox("Consumer", ["TUBE", "OEM", "H&T"], index=1)
     sel_stage = d2.selectbox("Stage (optional)",
         ["— all stages —"] +
-        sorted(df["stage"].dropna().astype(str).unique().tolist()))
+        sorted(PIPE.scoped(df)["stage"].dropna().astype(str)
+               .unique().tolist()))
     stg = None if sel_stage.startswith("—") else sel_stage
     cb  = PIPE.customer_breakup(df, sel_cons, stg)
     if cb.empty:
@@ -853,7 +1011,8 @@ elif page == "🎯 Plan Builder":
                     path=wip_path, mode=mode,
                     current_rolls={"CRM04": rt04, "CRM06": rt06},
                     mt_on_rolls={"CRM04": mu04, "CRM06": mu06},
-                    demand=demand, db=load_db())
+                    demand=demand, db=load_db(),
+                    full=df)   # reuse the already-loaded enriched WIP
                 st.session_state.plan_cfg = dict(
                     mode=mode, shift=shift, rt04=rt04, rt06=rt06,
                     mu04=mu04, mu06=mu06, demand=demand)
