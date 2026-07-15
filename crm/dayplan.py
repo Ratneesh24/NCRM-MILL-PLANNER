@@ -29,6 +29,48 @@ from . import config as C
 from .scoring import SectionScore
 from .campaign import alternate_order, sequence_coils
 
+# Original WIP column names required to reproduce the standard Mill Plan
+# Excel layout exactly (see generator._coil_row). Captured once per coil
+# at build/append time so the export never depends on the WIP file or an
+# active session still being around later.
+_RAW_COLS = [
+    "Coil Number", "SO No", "Actual Thick", "Actual Width",
+    "Input Coil Weight", "Plan Rolling Thick 1", "Customer Desc",
+    "Product Code", "Actual Quality", "Cust TDC", "Production Plant",
+    "Storage Location", "Planning Remark", "Current Stage", "Next Stage",
+    "Process Route", "Surface Finish", "Edge", "Coil Age(# Days)",
+]
+
+
+def _sequence_coils_full(df: pd.DataFrame, section_key: str) -> List[dict]:
+    """
+    Same ordering as campaign.sequence_coils (width↓, thick↓, grade,
+    age↓) but the returned dicts carry BOTH the lean keys used by the
+    scoring/campaign/UI logic (coil, mt, width, thick, rt, age, quality,
+    customer, qual_risk, section) AND every raw WIP column needed to
+    reproduce the standard Mill Plan Excel layout untouched.
+    """
+    lean = sequence_coils(df, section_key)
+    if df is None or len(df) == 0:
+        return lean
+
+    # Build a lookup of raw rows keyed by (already-normalised) coil id,
+    # so we can attach the raw columns to each lean dict in the same
+    # width/thick/grade/age order sequence_coils already computed.
+    dcol = "coil" if "coil" in df.columns else "Coil Number"
+    raw_by_coil = {}
+    for _, r in df.iterrows():
+        cid = str(r.get(dcol, r.get("Coil Number", "")))
+        raw = {}
+        for col in _RAW_COLS:
+            v = r.get(col, "")
+            raw[col] = "" if pd.isna(v) else v
+        raw_by_coil[cid] = raw
+
+    for c in lean:
+        c["raw"] = raw_by_coil.get(c["coil"], {})
+    return lean
+
 KEY_PREFIX = "dayplan_"
 
 
@@ -114,7 +156,7 @@ def build_day_plan(
 
         for s in order:
             needed = s.roll_type
-            seq = sequence_coils(s.coils_df, s.section_key)
+            seq = _sequence_coils_full(s.coils_df, s.section_key)
             if not seq:
                 continue
 
@@ -323,7 +365,7 @@ def append_new_coils(plan: dict, scored: List[SectionScore]) -> Dict:
         added_here = 0
 
         for s in ms:
-            seq = sequence_coils(s.coils_df, s.section_key)
+            seq = _sequence_coils_full(s.coils_df, s.section_key)
             new_coils = [c for c in seq if c["coil"] not in existing]
             if not new_coils:
                 continue
@@ -399,70 +441,127 @@ def append_new_coils(plan: dict, scored: List[SectionScore]) -> Dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXPORT — flat, print-friendly Excel of the whole-day sheet
+# EXPORT — exact same layout as the standard Mill Plan
 # ══════════════════════════════════════════════════════════════════════════════
-def export_day_sheet_excel(plan: dict) -> bytes:
-    import io
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    thin = Side(style="thin", color="CCCCCC")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    hdr_fill  = PatternFill("solid", fgColor="37474F")
-    camp_fill = PatternFill("solid", fgColor="FFE0B2")
-    done_fill = PatternFill("solid", fgColor="E8F5E9")
-    hdr_font  = Font(bold=True, color="FFFFFF")
-    cols = ["Seq", "Coil", "Section", "Roll Type", "Width", "Thick", "RT",
-            "MT", "Customer", "Age(d)", "Consumer", "Rolled", "Rolled By"]
+def _reconstruct_sections(plan: dict) -> List[dict]:
+    """
+    Rebuild standard {section_key, mill, label, coils_df} blocks from the
+    day plan's locked-in coil order — grouped by section (not by roll
+    campaign), matching how the official Mill Plan is laid out. Because
+    the day plan never interleaves a section's own coils with another
+    section's, every coil belonging to one section is still contiguous
+    across however many roll-life chunks it was split into.
+    """
+    from constants import SECTION_SHORT_NAME
+    sections: List[dict] = []
 
     for mill in ("CRM04", "CRM06"):
         mp = plan.get("mills", {}).get(mill)
         if not mp:
             continue
-        ws = wb.create_sheet(f"{mill} — Day Sheet")
-        ws.append([f"{mill} WHOLE-DAY ROLLING SHEET",
-                   f"Generated {plan.get('generated_at','')[:16]}",
-                   f"Mode: {plan.get('mode','')}"])
-        ws.append([])
-        ws.append(cols)
-        for cell in ws[3]:
-            cell.font = hdr_font; cell.fill = hdr_fill; cell.border = border
-            cell.alignment = Alignment(horizontal="center")
-
-        seq = 0
+        order:  List[str] = []
+        rows:   Dict[str, List[dict]] = {}
         for camp in mp["campaigns"]:
-            row = [f"═══ {camp['roll_type']} CAMPAIGN"
-                   + (f"  🔄 CHANGE FROM {camp['change_from']}"
-                      if camp["needs_change"] else "")
-                   + f"  ·  {camp['n_coils']} coils, {camp['total_mt']:.1f} MT ═══"]
-            ws.append(row)
-            ws.merge_cells(start_row=ws.max_row, start_column=1,
-                           end_row=ws.max_row, end_column=len(cols))
-            for cell in ws[ws.max_row]:
-                cell.fill = camp_fill; cell.font = Font(bold=True)
-
             for c in camp["coils"]:
-                seq += 1
-                ws.append([
-                    seq, c["coil"], c.get("section", ""), camp["roll_type"],
-                    c.get("width", 0), c.get("thick", 0), c.get("rt", 0),
-                    c.get("mt", 0), c.get("customer", ""), c.get("age", 0),
-                    camp.get("consumer", ""),
-                    "✅" if c.get("rolled") else "",
-                    c.get("rolled_by", "") or "",
-                ])
-                if c.get("rolled"):
-                    for cell in ws[ws.max_row]:
-                        cell.fill = done_fill
-                for cell in ws[ws.max_row]:
-                    cell.border = border
+                sk = c.get("section", "UNKNOWN")
+                if sk not in rows:
+                    rows[sk] = []
+                    order.append(sk)
+                rows[sk].append(c)
 
-        widths = [6, 16, 20, 14, 8, 8, 8, 8, 20, 8, 10, 8, 14]
-        for i, w in enumerate(widths, 1):
-            ws.column_dimensions[chr(64 + i) if i <= 26 else "A"].width = w
+        for sk in order:
+            recs = []
+            for c in rows[sk]:
+                raw = dict(c.get("raw") or {})
+                if not raw:
+                    # fallback for coils captured before this fix, or
+                    # anything missing raw data — still exports, just
+                    # with blanks in the extra WIP-only columns
+                    raw = {
+                        "Coil Number": c["coil"], "Actual Thick": c.get("thick", 0),
+                        "Actual Width": c.get("width", 0),
+                        "Input Coil Weight": c.get("mt", 0),
+                        "Plan Rolling Thick 1": c.get("rt", 0),
+                        "Customer Desc": c.get("customer", ""),
+                        "Actual Quality": c.get("quality", ""),
+                        "Coil Age(# Days)": c.get("age", 0),
+                    }
+                recs.append(raw)
+            sections.append({
+                "section_key": sk, "mill": mill,
+                "label": SECTION_SHORT_NAME.get(sk, sk),
+                "coils_df": pd.DataFrame(recs),
+            })
+    return sections
+
+
+def export_day_sheet_excel(plan: dict, learning_db: Optional[dict] = None) -> bytes:
+    """
+    Export the day sheet in the EXACT standard Mill Plan Excel format —
+    same 19-column headers, same colored section headers, same per-
+    section subtotal formula, same grand total, same CRM-04/CRM-06
+    priority block at the bottom (via generator.write_sheet).
+
+    Rolled coils are highlighted with a light-green row fill and a cell
+    comment showing who rolled it and when — the only addition to the
+    standard layout, so the sheet stays instantly familiar to print and
+    hand over, while still showing shift progress.
+    """
+    import io
+    from datetime import date as _date_
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill
+    from openpyxl.comments import Comment
+    from generator import write_sheet
+
+    sections = _reconstruct_sections(plan)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    plan_date = _date_.fromisoformat(plan["date"])
+    _, ws = write_sheet(wb, plan_date, sections, learning_db)
+
+    # ── Overlay rolled status — replicate write_sheet's own row math ──
+    rolled_fill = PatternFill("solid", fgColor="C8E6C9")
+    row = 3
+    for sec in sections:
+        header_row = row
+        n = len(sec["coils_df"])
+        data_start = header_row + 1
+
+        # Build coil -> rolled lookup once per section from the plan
+        rolled_by_coil = {}
+        for camp in plan["mills"][sec["mill"]]["campaigns"]:
+            for c in camp["coils"]:
+                if c.get("section") == sec["section_key"]:
+                    rolled_by_coil[str(c["coil"])] = c
+
+        for i in range(n):
+            r = data_start + i
+            coil_no = str(sec["coils_df"].iloc[i].get("Coil Number", ""))
+            info = rolled_by_coil.get(coil_no)
+            if info and info.get("rolled"):
+                for cell in ws[r]:
+                    cell.fill = rolled_fill
+                who = info.get("rolled_by") or "—"
+                when = (info.get("rolled_at") or "")[:16].replace("T", " ")
+                ws.cell(row=r, column=2).comment = Comment(
+                    f"Rolled by {who}\n{when}", "Day Sheet")
+        row = data_start + n + 1   # subtotal row
+        row += 1                   # next section header row
+
+    # ── Info sheet — day-sheet-specific context with nowhere else to go ──
+    info = wb.create_sheet("Day Sheet Info")
+    info.append(["Date", plan.get("date", "")])
+    info.append(["Mode", plan.get("mode", "")])
+    info.append(["Generated at (UTC)", plan.get("generated_at", "")])
+    info.append([])
+    info.append(["Mill", "Coils", "MT", "Roll Changes", "Downtime (min)"])
+    for mill, mp in plan.get("mills", {}).items():
+        info.append([mill, mp["n_coils"], mp["planned_mt"],
+                     mp["n_changes"], mp["downtime_min"]])
+    for col, w in zip("ABCDE", [22, 12, 10, 14, 16]):
+        info.column_dimensions[col].width = w
 
     buf = io.BytesIO()
     wb.save(buf); buf.seek(0)
