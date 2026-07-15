@@ -29,6 +29,7 @@ from crm import scoring  as SCORE
 from crm import campaign as CAMP
 from crm import twin     as TWIN
 from crm import planner  as PLAN
+from crm import dayplan  as DAY
 
 
 # ── Shared WIP uploader — one upload serves every page ────────────────────
@@ -83,7 +84,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["📋 Generate Plan", "🏭 Pipeline Overview",
-         "🩺 Stage Health", "🎯 Plan Builder",
+         "🩺 Stage Health", "🎯 Plan Builder", "📅 Day Sheet",
          "🔮 Digital Twin", "🧠 Learn", "📊 Stats"],
         label_visibility="collapsed",
     )
@@ -1190,6 +1191,297 @@ elif page == "🎯 Plan Builder":
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE — 🔮 DIGITAL TWIN   (Guideline §8, §9)
 # ══════════════════════════════════════════════════════════════════════════════
+elif page == "📅 Day Sheet":
+    import pandas as pd
+    from datetime import date as _date
+
+    st.title("📅 Whole-Day Rolling Sheet")
+    st.caption(
+        "One continuous, priority-ordered list per mill for the whole day — "
+        "generated once, ticked off as coils are rolled. No more losing "
+        "track of what's done across shift changes."
+    )
+
+    today_str = str(_date.today())
+    plan = st.session_state.get("day_plan")
+    if plan is None or plan.get("date") != today_str:
+        plan = DAY.load_day_plan(today_str)
+        st.session_state.day_plan = plan
+
+    # ══════════════════════════════════════════════════════════════════
+    # NO PLAN YET TODAY — generate it once
+    # ══════════════════════════════════════════════════════════════════
+    if plan is None:
+        st.info(f"No day sheet exists yet for **{today_str}**. "
+               "Generate it once — priority order locks in and won't "
+               "re-rank as coils are ticked off.")
+
+        wip_path, df = wip_gate("wip_day")
+
+        with st.expander("⚙️ Generate Today's Day Sheet", expanded=True):
+            mode = st.selectbox("Planning mode", list(C.MODES.keys()),
+                                format_func=lambda k: C.MODES[k], key="day_mode")
+
+            st.markdown("**Rolls currently mounted**")
+            r1, r2 = st.columns(2)
+            with r1:
+                st.caption("CRM-04")
+                rt04 = st.selectbox("Roll type", C.ROLL_TYPES, key="day_rt04",
+                                    index=C.ROLL_TYPES.index("Bright"))
+                mu04 = st.number_input("MT already rolled on this roll",
+                                       0.0, 400.0, 0.0, 5.0, key="day_mu04")
+            with r2:
+                st.caption("CRM-06")
+                rt06 = st.selectbox("Roll type", C.ROLL_TYPES, key="day_rt06",
+                                    index=C.ROLL_TYPES.index("Light Matt"))
+                mu06 = st.number_input("MT already rolled on this roll",
+                                       0.0, 400.0, 0.0, 5.0, key="day_mu06")
+
+            st.markdown("**Daily demand (MT/day)**")
+            dcs = st.columns(3)
+            demand = {k: c.number_input(C.CONSUMERS[k]["label"], 0.0, 600.0,
+                                        float(C.CONSUMERS[k]["daily_mt"]), 5.0,
+                                        key=f"day_d_{k}")
+                      for c, k in zip(dcs, ("TUBE", "OEM", "H&T"))}
+
+            if st.button("🚀 Score & Preview", type="primary",
+                         use_container_width=True, key="day_score_btn"):
+                with st.spinner("Routing coils and scoring…"):
+                    R = PLAN.run_planning(
+                        path=wip_path, mode=mode,
+                        current_rolls={"CRM04": rt04, "CRM06": rt06},
+                        mt_on_rolls={"CRM04": mu04, "CRM06": mu06},
+                        demand=demand, db=load_db(), full=df)
+                    st.session_state.day_preview = R
+                    st.session_state.day_gen_cfg = dict(
+                        mode=mode, rt04=rt04, rt06=rt06, mu04=mu04, mu06=mu06)
+                st.rerun()
+
+        if "day_preview" in st.session_state:
+            R = st.session_state.day_preview
+            cfg = st.session_state.day_gen_cfg
+            scored = R["scored"]
+
+            st.markdown("### Preview — compare Priority vs. Min-Changeover")
+            st.caption(
+                "Pick per mill which order to lock in for the whole day. "
+                "This choice cannot be changed later without regenerating.")
+
+            plans_cmp = CAMP.compare_plans(
+                scored, {"CRM04": cfg["rt04"], "CRM06": cfg["rt06"]},
+                {"CRM04": cfg["mu04"], "CRM06": cfg["mu06"]})
+
+            use_alt = {}
+            pc1, pc2 = st.columns(2)
+            for col, mill in zip((pc1, pc2), ("CRM04", "CRM06")):
+                d = plans_cmp.get(mill)
+                if not d:
+                    continue
+                with col:
+                    st.markdown(f"**{mill}**")
+                    sv = d["savings_min"]
+                    if sv > 0:
+                        pick = st.radio(
+                            f"{mill} order",
+                            [f"⚡ Priority — {d['priority'].n_changes} change(s) "
+                             f"in first {d['priority'].capacity_mt:.0f} MT window",
+                             f"🔩 Min-changeover — saves {sv} min "
+                             f"(first-window estimate)"],
+                            key=f"day_pick_{mill}", label_visibility="collapsed")
+                        use_alt[mill] = pick.startswith("🔩")
+                    else:
+                        st.success("Priority order is already roll-optimal "
+                                   "in the near term.")
+                        use_alt[mill] = False
+
+            st.warning(
+                "⚠️ This comparison is a shift-window estimate to help you "
+                "choose an order. The generated day sheet itself is **not** "
+                "capacity-limited — every eligible coil is included, split "
+                "into roll campaigns by roll-life, not by shift size.")
+
+            if st.button("🔒 Lock In & Generate Whole-Day Sheet",
+                         type="primary", use_container_width=True,
+                         key="day_lock_btn"):
+                with st.spinner("Building the whole-day sheet…"):
+                    new_plan = DAY.build_day_plan(
+                        scored, cfg["mode"],
+                        {"CRM04": cfg["rt04"], "CRM06": cfg["rt06"]},
+                        {"CRM04": cfg["mu04"], "CRM06": cfg["mu06"]},
+                        use_alternate=use_alt)
+                    ok = DAY.save_day_plan(new_plan)
+                    if ok:
+                        st.session_state.day_plan = new_plan
+                        st.session_state.pop("day_preview", None)
+                        st.success("✅ Day sheet generated and saved — "
+                                   "visible to every shift from now on.")
+                        st.rerun()
+                    else:
+                        st.error("Could not save to Supabase — check your "
+                                "connection. The sheet was NOT persisted, "
+                                "so it won't be visible to other shifts.")
+        st.stop()
+
+    # ══════════════════════════════════════════════════════════════════
+    # PLAN EXISTS — show it, tick off, append, download
+    # ══════════════════════════════════════════════════════════════════
+    top1, top2, top3 = st.columns([3, 1, 1])
+    top1.success(f"📅 Day sheet for **{plan['date']}** · mode "
+                 f"**{C.MODES.get(plan['mode'], plan['mode'])}** · "
+                 f"generated {plan.get('generated_at','')[:16]} UTC")
+    if top2.button("🔄 Refresh", use_container_width=True,
+                   help="Reload from the database — see what other "
+                        "shifts have ticked off"):
+        st.session_state.day_plan = DAY.load_day_plan(today_str)
+        st.rerun()
+    if top3.button("🗑️ Discard & Restart", use_container_width=True):
+        st.session_state["confirm_discard"] = True
+
+    if st.session_state.get("confirm_discard"):
+        st.error("This deletes today's day sheet — all rolled/pending "
+                 "status is lost for every shift. Are you sure?")
+        cc1, cc2 = st.columns(2)
+        if cc1.button("Yes, discard it", type="primary",
+                      use_container_width=True):
+            DAY.delete_day_plan(today_str)
+            st.session_state.day_plan = None
+            st.session_state.pop("confirm_discard", None)
+            st.rerun()
+        if cc2.button("Cancel", use_container_width=True):
+            st.session_state.pop("confirm_discard", None)
+            st.rerun()
+
+    rolled_by = st.text_input(
+        "Your name (recorded against coils you tick off)",
+        value=st.session_state.get("rolled_by_name", ""), key="rolled_by_name")
+
+    st.divider()
+
+    # ── Overall progress ─────────────────────────────────────────────
+    p1, p2 = st.columns(2)
+    for col, mill in zip((p1, p2), ("CRM04", "CRM06")):
+        if mill not in plan["mills"]:
+            continue
+        prog = DAY.progress(plan, mill)
+        pct = (prog["rolled_mt"] / prog["total_mt"] * 100
+               if prog["total_mt"] else 0)
+        with col:
+            st.markdown(f"**🏭 {mill}**")
+            st.progress(min(pct / 100, 1.0),
+                       text=f"{prog['rolled_coils']}/{prog['total_coils']} coils · "
+                            f"{prog['rolled_mt']:.1f}/{prog['total_mt']:.1f} MT "
+                            f"({pct:.0f}%)")
+
+    st.divider()
+
+    # ── Append new WIP mid-day ───────────────────────────────────────
+    with st.expander("📥 Append coils from a new WIP refresh"):
+        st.caption(
+            "Upload a fresh WIP export — only coils not already on "
+            "today's sheet are added. Existing order and rolled/pending "
+            "status are untouched.")
+        new_wip = st.file_uploader("New WIP file", type=["xlsx"], key="day_append_wip")
+        if new_wip and st.button("➕ Append new eligible coils",
+                                 use_container_width=True, key="day_append_btn"):
+            with st.spinner("Scoring new WIP and appending…"):
+                nwip = new_wip.read()
+                with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as t:
+                    t.write(nwip); np_ = t.name
+                ndf = PIPE.load_pipeline(np_)
+                Rn = PLAN.run_planning(
+                    path=np_, mode=plan["mode"],
+                    current_rolls={m: plan["mills"][m]["current_roll_at_start"]
+                                  for m in plan["mills"]},
+                    mt_on_rolls={m: plan["mills"][m]["mt_on_roll_at_start"]
+                                for m in plan["mills"]},
+                    db=load_db(), full=ndf)
+                res = DAY.append_new_coils(plan, Rn["scored"])
+                st.session_state.day_plan = plan
+            if res["added"]:
+                st.success(f"✅ Added {res['added']} new coil(s): " +
+                          ", ".join(f"{m} +{n}" for m, n in
+                                    res["mills"].items() if n))
+            else:
+                st.info("No new eligible coils found beyond what's "
+                       "already on the sheet.")
+            st.rerun()
+
+    st.divider()
+
+    # ── Per-mill rolling sheet with tick-off ─────────────────────────
+    for mill in ("CRM04", "CRM06"):
+        mp = plan["mills"].get(mill)
+        if not mp:
+            continue
+        st.subheader(f"🏭 {mill} — {mp['n_coils']} coils · "
+                    f"{mp['planned_mt']:.1f} MT · {mp['n_changes']} roll "
+                    f"change(s) · {mp['downtime_min']} min total downtime")
+
+        seq = 0
+        for ci, camp in enumerate(mp["campaigns"], 1):
+            is_dressing = (camp["needs_change"]
+                          and camp["change_from"] == camp["roll_type"])
+            if camp["needs_change"] and not is_dressing:
+                st.markdown(f"🔄 **ROLL CHANGE: {camp['change_from']} → "
+                           f"{camp['roll_type']}** · {C.ROLL_CHANGE_MIN} min")
+            elif is_dressing:
+                st.markdown(f"🔧 **DRESSING — {camp['roll_type']} roll life "
+                           f"reached** · {C.ROLL_CHANGE_MIN} min")
+
+            n_rolled = sum(1 for c in camp["coils"] if c.get("rolled"))
+            label = (f"Campaign {ci}: **{camp['roll_type']}** — "
+                    f"{camp['n_coils']} coils · {camp['total_mt']:.1f} MT "
+                    f"· {n_rolled}/{camp['n_coils']} rolled")
+            if camp["over_life"]:
+                label += "  ⚠️ over roll life"
+
+            with st.expander(label, expanded=(n_rolled < camp["n_coils"])):
+                st.progress(min(camp["mt_end"] / camp["roll_life"], 1.0)
+                           if camp["roll_life"] else 0,
+                           text=f"Roll life: {camp['mt_start']:.0f} → "
+                                f"{camp['mt_end']:.0f} / {camp['roll_life']} MT")
+                for w in camp.get("warnings", []):
+                    st.caption(w)
+
+                for c in camp["coils"]:
+                    seq += 1
+                    rolled = c.get("rolled", False)
+                    if rolled:
+                        st.markdown(
+                            f"~~**{seq}. {c['coil']}**  "
+                            f"W={c['width']:.0f} T={c['thick']:.2f}→{c['rt']:.2f} "
+                            f"{c['mt']:.3f}MT  {c['customer']}~~  "
+                            f"✅ *rolled by {c.get('rolled_by') or '—'} "
+                            f"at {(c.get('rolled_at') or '')[:16]}*")
+                    else:
+                        age = c.get("age", 0)
+                        flag = "🔴" if age > 21 else "🟡" if age > 14 else ""
+                        cc1, cc2 = st.columns([9, 1])
+                        cc1.markdown(
+                            f"{flag} **{seq}. {c['coil']}**  "
+                            f"W={c['width']:.0f}mm T={c['thick']:.2f}→"
+                            f"{c['rt']:.2f}mm  {c['mt']:.3f}MT  "
+                            f"*{c['customer']}*  Age:{age:.0f}d")
+                        if cc2.button("✅", key=f"day_roll_{mill}_{c['coil']}"):
+                            DAY.mark_coil(plan, mill, c["coil"], True,
+                                         rolled_by=rolled_by or None)
+                            st.session_state.day_plan = plan
+                            st.rerun()
+
+    st.divider()
+
+    # ── Download ──────────────────────────────────────────────────────
+    st.subheader("📄 Download")
+    xlsx = DAY.export_day_sheet_excel(plan)
+    st.download_button(
+        "⬇️ Download Whole-Day Rolling Sheet (Excel)",
+        data=xlsx,
+        file_name=f"day_sheet_{plan['date']}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary", use_container_width=True)
+    st.caption("Includes rolled/pending status and who rolled each coil — "
+              "safe to print and hand to the next shift.")
+
 elif page == "🔮 Digital Twin":
     import pandas as pd
     st.title("🔮 Digital Twin — Future Pipeline")
