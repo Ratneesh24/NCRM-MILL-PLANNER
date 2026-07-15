@@ -456,80 +456,74 @@ def _reconstruct_sections(plan: dict) -> List[dict]:
     sections: List[dict] = []
 
     for mill in ("CRM04", "CRM06"):
-        mp = plan.get("mills", {}).get(mill)
-        if not mp:
-            continue
-        order:  List[str] = []
-        rows:   Dict[str, List[dict]] = {}
-        for camp in mp["campaigns"]:
-            for c in camp["coils"]:
-                sk = c.get("section", "UNKNOWN")
-                if sk not in rows:
-                    rows[sk] = []
-                    order.append(sk)
-                rows[sk].append(c)
-
-        for sk in order:
-            recs = []
-            for c in rows[sk]:
-                raw = dict(c.get("raw") or {})
-                if not raw:
-                    # fallback for coils captured before this fix, or
-                    # anything missing raw data — still exports, just
-                    # with blanks in the extra WIP-only columns
-                    raw = {
-                        "Coil Number": c["coil"], "Actual Thick": c.get("thick", 0),
-                        "Actual Width": c.get("width", 0),
-                        "Input Coil Weight": c.get("mt", 0),
-                        "Plan Rolling Thick 1": c.get("rt", 0),
-                        "Customer Desc": c.get("customer", ""),
-                        "Actual Quality": c.get("quality", ""),
-                        "Coil Age(# Days)": c.get("age", 0),
-                    }
-                recs.append(raw)
-            sections.append({
-                "section_key": sk, "mill": mill,
-                "label": SECTION_SHORT_NAME.get(sk, sk),
-                "coils_df": pd.DataFrame(recs),
-            })
+        sections.extend(_reconstruct_sections_for_mill(plan, mill))
     return sections
 
 
-def export_day_sheet_excel(plan: dict, learning_db: Optional[dict] = None) -> bytes:
-    """
-    Export the day sheet in the EXACT standard Mill Plan Excel format —
-    same 19-column headers, same colored section headers, same per-
-    section subtotal formula, same grand total, same CRM-04/CRM-06
-    priority block at the bottom (via generator.write_sheet).
+def _reconstruct_sections_for_mill(plan: dict, mill: str) -> List[dict]:
+    """Standard section blocks for ONE mill only, in locked-in order."""
+    from constants import SECTION_SHORT_NAME
+    mp = plan.get("mills", {}).get(mill)
+    if not mp:
+        return []
 
-    Rolled coils are highlighted with a light-green row fill and a cell
-    comment showing who rolled it and when — the only addition to the
-    standard layout, so the sheet stays instantly familiar to print and
-    hand over, while still showing shift progress.
+    order: List[str] = []
+    rows:  Dict[str, List[dict]] = {}
+    for camp in mp["campaigns"]:
+        for c in camp["coils"]:
+            sk = c.get("section", "UNKNOWN")
+            if sk not in rows:
+                rows[sk] = []
+                order.append(sk)
+            rows[sk].append(c)
+
+    sections: List[dict] = []
+    for sk in order:
+        recs = []
+        for c in rows[sk]:
+            raw = dict(c.get("raw") or {})
+            if not raw:
+                # fallback for coils captured before raw-capture existed
+                raw = {
+                    "Coil Number": c["coil"], "Actual Thick": c.get("thick", 0),
+                    "Actual Width": c.get("width", 0),
+                    "Input Coil Weight": c.get("mt", 0),
+                    "Plan Rolling Thick 1": c.get("rt", 0),
+                    "Customer Desc": c.get("customer", ""),
+                    "Actual Quality": c.get("quality", ""),
+                    "Coil Age(# Days)": c.get("age", 0),
+                }
+            recs.append(raw)
+        sections.append({
+            "section_key": sk, "mill": mill,
+            "label": SECTION_SHORT_NAME.get(sk, sk),
+            "coils_df": pd.DataFrame(recs),
+        })
+    return sections
+
+
+def _overlay_rolled(ws, sections: List[dict], plan: dict) -> None:
     """
-    import io
-    from datetime import date as _date_
-    from openpyxl import Workbook
+    Highlight rolled coils (light-green fill + comment) on a sheet that
+    was just written by generator.write_sheet.
+
+    write_sheet's row layout per section is:
+        header row               (1 row)
+        one row per coil         (n rows)
+        subtotal row             (1 row)
+    with NO blank spacer between sections. The first section header is at
+    row 3. So each section consumes (n + 2) rows and the next section
+    header follows immediately.
+    """
     from openpyxl.styles import PatternFill
     from openpyxl.comments import Comment
-    from generator import write_sheet
-
-    sections = _reconstruct_sections(plan)
-
-    wb = Workbook()
-    wb.remove(wb.active)
-    plan_date = _date_.fromisoformat(plan["date"])
-    _, ws = write_sheet(wb, plan_date, sections, learning_db)
-
-    # ── Overlay rolled status — replicate write_sheet's own row math ──
     rolled_fill = PatternFill("solid", fgColor="C8E6C9")
-    row = 3
-    for sec in sections:
-        header_row = row
-        n = len(sec["coils_df"])
-        data_start = header_row + 1
 
-        # Build coil -> rolled lookup once per section from the plan
+    row = 3  # first section header (matches write_sheet's row_idx start)
+    for sec in sections:
+        n = len(sec["coils_df"])
+        data_start = row + 1
+
         rolled_by_coil = {}
         for camp in plan["mills"][sec["mill"]]["campaigns"]:
             for c in camp["coils"]:
@@ -543,14 +537,54 @@ def export_day_sheet_excel(plan: dict, learning_db: Optional[dict] = None) -> by
             if info and info.get("rolled"):
                 for cell in ws[r]:
                     cell.fill = rolled_fill
-                who = info.get("rolled_by") or "—"
+                who  = info.get("rolled_by") or "—"
                 when = (info.get("rolled_at") or "")[:16].replace("T", " ")
                 ws.cell(row=r, column=2).comment = Comment(
                     f"Rolled by {who}\n{when}", "Day Sheet")
-        row = data_start + n + 1   # subtotal row
-        row += 1                   # next section header row
 
-    # ── Info sheet — day-sheet-specific context with nowhere else to go ──
+        # advance to the next section header: n coils + 1 subtotal row
+        row = data_start + n + 1
+
+
+def export_day_sheet_excel(plan: dict, learning_db: Optional[dict] = None) -> bytes:
+    """
+    Export the day sheet in the EXACT standard Mill Plan Excel format,
+    with CRM-04 and CRM-06 on SEPARATE sheets (one tab per mill) — same
+    19-column headers, coloured section headers, per-section subtotal
+    formula, grand total and per-mill priority block (via
+    generator.write_sheet).
+
+    Rolled coils are highlighted with a light-green row fill and a cell
+    comment showing who rolled it and when — the only addition to the
+    standard layout, so each sheet stays instantly familiar to print and
+    hand over while still showing shift progress.
+    """
+    import io
+    from datetime import date as _date_
+    from openpyxl import Workbook
+    from generator import write_sheet
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    plan_date = _date_.fromisoformat(plan["date"])
+
+    any_written = False
+    for mill in ("CRM04", "CRM06"):
+        sections = _reconstruct_sections_for_mill(plan, mill)
+        if not sections:
+            continue
+        # one tab per mill — pass explicit sheet_name so the two mills
+        # don't collide on the date-named tab
+        _, ws = write_sheet(wb, plan_date, sections, learning_db,
+                            sheet_name=f"{mill} {plan_date.strftime('%d-%m-%Y')}")
+        _overlay_rolled(ws, sections, plan)
+        any_written = True
+
+    if not any_written:
+        # nothing planned — emit an empty but valid workbook
+        wb.create_sheet("Day Sheet")
+
+    # ── Info sheet — day-sheet-specific context ──────────────────────────
     info = wb.create_sheet("Day Sheet Info")
     info.append(["Date", plan.get("date", "")])
     info.append(["Mode", plan.get("mode", "")])
