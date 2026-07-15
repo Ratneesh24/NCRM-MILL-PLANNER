@@ -573,10 +573,15 @@ def export_day_sheet_excel(plan: dict, learning_db: Optional[dict] = None) -> by
         sections = _reconstruct_sections_for_mill(plan, mill)
         if not sections:
             continue
-        # one tab per mill — pass explicit sheet_name so the two mills
-        # don't collide on the date-named tab
-        _, ws = write_sheet(wb, plan_date, sections, learning_db,
-                            sheet_name=f"{mill} {plan_date.strftime('%d-%m-%Y')}")
+        # One tab per mill. We rename the sheet AFTER write_sheet creates
+        # it (rather than passing a sheet_name kwarg) so this works with
+        # any version of generator.write_sheet — including older ones
+        # whose signature doesn't accept sheet_name.
+        _, ws = write_sheet(wb, plan_date, sections, learning_db)
+        new_name = f"{mill} {plan_date.strftime('%d-%m-%Y')}"[:31]
+        if new_name in wb.sheetnames and wb[new_name] is not ws:
+            del wb[new_name]
+        ws.title = new_name
         _overlay_rolled(ws, sections, plan)
         any_written = True
 
